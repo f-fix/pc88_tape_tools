@@ -461,24 +461,74 @@ class CMTFile:
 
             # 2. Tokenized BASIC Program (0xD3) - Line-by-line pointer traversal
             elif preamble_byte == 0xD3:
-                data_p = buf.find(b"\xd3" * 3, body_start)
+                # BASIC has two ROM-compatible layouts in real CMT dumps:
+                #
+                #   1) CSAVE streams with a second D3 sync run before the
+                #      linked BASIC lines.
+                #   2) N-BASIC V1 streams where the linked-line area follows
+                #      the filename immediately (no second D3 run).
+                #
+                # The old parser searched for the second sync run, so it
+                # consumed the entire V1 file as one BASIC file.  Treat this
+                # as a small state machine: consume an optional sync state,
+                # then walk the linked-list line records until the zero
+                # pointer terminator.
                 file_end = n
-                if data_p != -1:
-                    d_idx = data_p + 3
-                    while d_idx < n and buf[d_idx] == 0xD3:
-                        d_idx += 1
-                    curr_p = d_idx
-                    while curr_p + 2 <= n:
-                        next_ptr = buf[curr_p] | (buf[curr_p + 1] << 8)
-                        if next_ptr == 0x0000:
-                            file_end = curr_p + 2
-                            break
-                        if curr_p + 4 > n:
-                            break
-                        line_zero = buf.find(b"\x00", curr_p + 4)
-                        if line_zero == -1:
-                            break
-                        curr_p = line_zero + 1
+                curr_p = body_start
+
+                # STATE: BASIC_SYNC -- optional carrier/CSAVE sync bytes.
+                if curr_p + 3 <= n and buf[curr_p : curr_p + 3] == b"\xd3" * 3:
+                    while curr_p < n and buf[curr_p] == 0xD3:
+                        curr_p += 1
+
+                # STATE: BASIC_LINES -- [next-pointer:2][line-number:2]
+                # followed by tokenized text terminated by 0x00.  The
+                # next-pointer is a RAM address, so it is deliberately not
+                # used as a file offset.
+                line_count = 0
+                while curr_p + 2 <= n:
+                    next_ptr = buf[curr_p] | (buf[curr_p + 1] << 8)
+
+                    # STATE: BASIC_DONE
+                    if next_ptr == 0x0000:
+                        file_end = curr_p + 2
+                        break
+
+                    # A real BASIC line has a four-byte fixed prefix:
+                    # next pointer + line number.
+                    if curr_p + 4 > n:
+                        break
+
+                    # STATE: BASIC_TEXT -- consume through the line's
+                    # terminating zero byte, then return to BASIC_LINES.
+                    line_zero = buf.find(b"\x00", curr_p + 4)
+                    if line_zero == -1:
+                        break
+
+                    curr_p = line_zero + 1
+                    line_count += 1
+
+                # If the direct layout did not produce a linked-line
+                # terminator, retain the old conservative behavior: a D3
+                # sync may occur later in the stream, but only accept it if
+                # the linked-list walk actually reaches a terminator.
+                if file_end == n and line_count == 0:
+                    data_p = buf.find(b"\xd3" * 3, body_start)
+                    if data_p != -1:
+                        curr_p = data_p + 3
+                        while curr_p < n and buf[curr_p] == 0xD3:
+                            curr_p += 1
+                        while curr_p + 2 <= n:
+                            next_ptr = buf[curr_p] | (buf[curr_p + 1] << 8)
+                            if next_ptr == 0x0000:
+                                file_end = curr_p + 2
+                                break
+                            if curr_p + 4 > n:
+                                break
+                            line_zero = buf.find(b"\x00", curr_p + 4)
+                            if line_zero == -1:
+                                break
+                            curr_p = line_zero + 1
 
                 chunk_data = buf[file_start:file_end]
                 uname = self._dedup_name(fname, used_names)
