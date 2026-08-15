@@ -1,7 +1,7 @@
 # pc88_tape_tools
 pc88_tape_tools - convert between t88 and cmt, and split/join cmt files
 
-## NEC PC-8001 / PC-8801 Cassette Tape Format Utility (`pc88_tape_tool.py`).
+## NEC PC-8001 / PC-8801 Cassette Tape Format Utility (`pc88_tape_tools.py`).
 
 Provides parsing, splitting, joining, and bidirectional conversion between the
 multi-file container format (.t88) and raw sequential tape dumps (.cmt).
@@ -18,7 +18,7 @@ Supported Protocols & Formats:
 
 ### Output of `--help`
 ```
-usage: pc88_tape_tool.py [-h] [--test] {t2c,c2t,split-cmt,join-cmt} ...
+usage: pc88_tape_tools.py [-h] [--test] {t2c,c2t,split-cmt,join-cmt} ...
 
 NEC PC-8001 / PC-8801 Cassette Tape Format Utility (.t88 / .cmt)
 
