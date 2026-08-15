@@ -214,19 +214,41 @@ class CMTFile:
         0x24: "MON Machine Language Header (0x24)",
     }
 
+    # Canonical CSAVE/monitor sync-tone length. A preamble run at least this
+    # long is treated as a genuine sync burst (real tape lead-in), so a
+    # null-padded name following it is trusted. Shorter runs (3-4 bytes,
+    # common as coincidental repeats inside binary payload data) are NOT
+    # trusted with null-padding, since that combination is what produces
+    # false-positive header matches inside machine-code data.
+    CANONICAL_SYNC_LEN: int = 8
+
     def __init__(self, data: bytes = b"") -> None:
         self.data: bytes = data
 
     @classmethod
-    def is_valid_cassette_filename(cls, name_bytes: bytes) -> bool:
-        """Verifies if a 6-byte sequence forms a valid space-padded PC-8001/PC-8801 cassette filename."""
+    def is_valid_cassette_filename(
+        cls, name_bytes: bytes, allow_null: bool = False
+    ) -> bool:
+        """Verifies if a 6-byte sequence forms a valid space-padded PC-8001/PC-8801 cassette filename.
+
+        allow_null: permits trailing/embedded 0x00 padding bytes in the name
+        (some real tapes null-pad short names, e.g. "DOOR\x00\x00" instead of
+        space-padding). This must only be set true by callers who have already
+        confirmed a long, canonical preamble sync run (>= CANONICAL_SYNC_LEN)
+        precedes the candidate name -- short/ambiguous sync runs are far more
+        likely to be coincidental byte patterns inside binary payload data, and
+        allowing null bytes there causes false-positive header detection.
+        """
         if len(name_bytes) != 6:
             return False
-        valid_chars = sum(
-            1 for b in name_bytes if (32 <= b <= 126) or (0xA1 <= b <= 0xDF)
+        ok_byte = (
+            lambda b: (32 <= b <= 126)
+            or (0xA1 <= b <= 0xDF)
+            or (allow_null and b == 0x00)
         )
+        valid_chars = sum(1 for b in name_bytes if ok_byte(b))
         if valid_chars == 6:
-            non_spaces = [b for b in name_bytes if b != 0x20]
+            non_spaces = [b for b in name_bytes if b not in (0x20, 0x00)]
             if len(non_spaces) > 0:
                 return True
         return False
@@ -246,7 +268,10 @@ class CMTFile:
                         idx += 1
                     if idx + 6 <= len(chunk):
                         name_bytes = chunk[idx : idx + 6]
-                        if cls.is_valid_cassette_filename(name_bytes):
+                        allow_null = idx >= cls.CANONICAL_SYNC_LEN
+                        if cls.is_valid_cassette_filename(
+                            name_bytes, allow_null=allow_null
+                        ):
                             name_str = "".join(
                                 chr(b) if (32 <= b <= 126 or 0xA1 <= b <= 0xDF) else " "
                                 for b in name_bytes
@@ -346,7 +371,10 @@ class CMTFile:
                                 idx += 1
                             if idx + 6 <= n:
                                 name_bytes = buf[idx : idx + 6]
-                                if self.is_valid_cassette_filename(name_bytes):
+                                allow_null = (idx - i) >= self.CANONICAL_SYNC_LEN
+                                if self.is_valid_cassette_filename(
+                                    name_bytes, allow_null=allow_null
+                                ):
                                     name_str = "".join(
                                         (
                                             chr(c)
@@ -592,6 +620,28 @@ class TestPC88TapeTool(unittest.TestCase):
 
         self.combined_cmt = self.ml_file + self.basic_file + self.ascii_file
 
+        # 4. Null-padded CSAVE Program (short name, zero-padded instead of
+        # space-padded) preceded by a full canonical sync run. Regression
+        # test for a real-world tape ("DOOR" saved in N-BASIC V1 mode) that
+        # a naive space-only filename validator fails to recognize at all.
+        self.null_padded_basic_file = (
+            (b"\xd3" * 10 + b"DOOR\x00\x00")
+            + struct.pack("<HH", 0x8010, 10)
+            + b'\x90 "DOOR"'
+            + b"\x00"
+            + struct.pack("<H", 0x0000)
+        )
+
+        # 5. Short (non-canonical) sync run immediately followed by bytes
+        # that coincidentally resemble a null-padded name. This must NOT be
+        # picked up as a header -- it's a regression test for a real
+        # false-positive found inside genuine binary payload data on a real
+        # tape dump (a 3-byte run of 0x24 followed by "DTTT\\x00\\x00" buried
+        # inside an unrelated machine-code file's data).
+        self.coincidental_short_run = (
+            b"\x00" * 4 + b"\x24\x24\x24" + b"DTTT\x00\x00" + b"\x00" * 4
+        )
+
     def test_t88_block_pack_unpack(self) -> None:
         """Tests T88Block serialization and deserialization."""
         header = struct.pack("<IIHH", 0, 440, 10, 0)
@@ -650,6 +700,25 @@ class TestPC88TapeTool(unittest.TestCase):
 
         joined = CMTFile.join([item[2] for item in split_items])
         self.assertEqual(joined.data, self.combined_cmt)
+
+    def test_null_padded_filename_after_canonical_sync(self) -> None:
+        """Null-padded name IS recognized when preceded by a full sync run."""
+        cmt_file = CMTFile(self.null_padded_basic_file)
+        split_items = cmt_file.split()
+        self.assertEqual(len(split_items), 1)
+        self.assertEqual(split_items[0][0], "DOOR")
+        self.assertEqual(split_items[0][1], "BASIC Program (0xD3)")
+        self.assertEqual(split_items[0][2], self.null_padded_basic_file)
+
+    def test_no_false_positive_on_short_run_with_nulls(self) -> None:
+        """Null-padded-looking bytes after a short/non-canonical sync run
+        must NOT be treated as a real header (avoids false positives inside
+        ordinary binary payload data)."""
+        cmt_file = CMTFile(self.coincidental_short_run)
+        split_items = cmt_file.split()
+        # Should be treated as one opaque raw blob, not split at "DTTT".
+        self.assertEqual(len(split_items), 1)
+        self.assertNotEqual(split_items[0][0], "DTTT")
 
     def test_split_t88_with_carrier_blocks(self) -> None:
         """Tests splitting a T88 container separated by authentic carrier blocks."""
