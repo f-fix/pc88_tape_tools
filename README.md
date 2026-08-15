@@ -16,31 +16,34 @@ Supported Protocols & Formats:
 - .t88: Authentic Manuke Station / X88000 24-byte header container format
   with 12-byte DATA sub-headers and carrier lead-in/gap tags.
 
-### Output of `--help`
+### Output of `--help-all`
 ```
-usage: pc88_tape_tools.py [-h] [--test]
-                          {t2c,c2t,split-cmt,split-t88,join-cmt,join-t88} ...
+usage: pc88_tape_tools.py [-h] [--test] [--help-all] <command> ...
 
 NEC PC-8001 / PC-8801 Cassette Tape Format Utility (.t88 / .cmt)
 
-positional arguments:
-  {t2c,c2t,split-cmt,split-t88,join-cmt,join-t88}
-                        Subcommand to execute
-    t2c                 Convert .t88 container to raw .cmt tape dump
-    c2t                 Convert raw .cmt tape dump to .t88 container
-    split-cmt           Split multi-file .cmt or .t88 into individual .cmt
-                        files
-    split-t88           Split multi-file .cmt or .t88 into individual .t88
-                        files
-    join-cmt            Join multiple files into a single .cmt file
-    join-t88            Join multiple files into a single .t88 container
-
 options:
-  -h, --help            show this help message and exit
-  --test                Run internal unit tests and exit
-```
+  -h, --help   show this help message and exit
+  --test       Run internal unit tests and exit
+  --help-all   Show full detailed help for all subcommands at once and exit
 
-```
+Available Subcommands:
+  <command>
+    t2c        Convert .t88 container to raw .cmt tape dump
+    c2t        Convert raw .cmt tape dump to .t88 container
+    split-cmt  Split multi-file .cmt or .t88 into individual .cmt files
+    split-t88  Split multi-file .cmt or .t88 into individual .t88 files
+    join-cmt   Join multiple files into a single .cmt file
+    join-t88   Join multiple files into a single .t88 container
+
+Tip: Run 'pc88_tape_tools.py <subcommand> --help' (e.g. 'pc88_tape_tools.py split-t88 --help') or 'pc88_tape_tools.py --help-all' to view detailed options for all subcommands at once.
+
+
+================================================================================
+DETAILED SUBCOMMAND HELP
+================================================================================
+
+--- Subcommand: t2c ---
 usage: pc88_tape_tools.py t2c [-h] [-o OUTPUT] input
 
 positional arguments:
@@ -49,9 +52,8 @@ positional arguments:
 options:
   -h, --help           show this help message and exit
   -o, --output OUTPUT  Path to output .cmt file (optional)
-```
 
-```
+--- Subcommand: c2t ---
 usage: pc88_tape_tools.py c2t [-h] [-o OUTPUT] [--comment COMMENT] [-b BAUD]
                               input
 
@@ -63,9 +65,8 @@ options:
   -o, --output OUTPUT  Path to output .t88 file (optional)
   --comment COMMENT    Optional comment metadata string embedded in T88 file
   -b, --baud BAUD      Baud rate for output T88 file (default: 1200)
-```
 
-```
+--- Subcommand: split-cmt ---
 usage: pc88_tape_tools.py split-cmt [-h] [-o OUTPUT_DIR] input
 
 positional arguments:
@@ -75,9 +76,8 @@ options:
   -h, --help            show this help message and exit
   -o, --output-dir OUTPUT_DIR
                         Output directory for split files (optional)
-```
 
-```
+--- Subcommand: split-t88 ---
 usage: pc88_tape_tools.py split-t88 [-h] [-o OUTPUT_DIR] [-b BAUD]
                                     [--cmt-baud CMT_BAUD] [--comment COMMENT]
                                     input
@@ -95,9 +95,8 @@ options:
                         Default baud rate when input is a raw .cmt file
                         (default: 1200)
   --comment COMMENT     Optional comment metadata string embedded in T88 files
-```
 
-```
+--- Subcommand: join-cmt ---
 usage: pc88_tape_tools.py join-cmt [-h] -o OUTPUT inputs [inputs ...]
 
 positional arguments:
@@ -106,9 +105,8 @@ positional arguments:
 options:
   -h, --help           show this help message and exit
   -o, --output OUTPUT  Path to output merged .cmt file
-```
 
-```
+--- Subcommand: join-t88 ---
 usage: pc88_tape_tools.py join-t88 [-h] -o OUTPUT [-b BAUD]
                                    [--cmt-baud CMT_BAUD] [--comment COMMENT]
                                    inputs [inputs ...]
