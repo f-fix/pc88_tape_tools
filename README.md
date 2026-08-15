@@ -1,21 +1,64 @@
 # pc88_tape_tools
-pc88_tape_tools - convert between t88 and cmt, and split/join cmt files
+pc88_tape_tools - convert between t88 and cmt, and split/join/analyze cmt files
 
 ## NEC PC-8001 / PC-8801 Cassette Tape Format Utility (`pc88_tape_tools.py`).
 
-Provides parsing, splitting, joining, and bidirectional conversion between the
-multi-file container format (.t88) and raw sequential tape dumps (.cmt).
+Provides state-machine parsing, splitting, joining, diagnostic analysis, and bidirectional
+conversion between physical container images (.t88) and raw sequential tape dumps (.cmt).
 
-Supported Protocols & Formats:
-- N-BASIC (PC-8001), N80-BASIC (PC-8001mkII), N88-BASIC V1/V2 (PC-8801 series)
-- .cmt: Sequential tape stream using exact BIOS / Monitor ROM state machine:
-  - 0x24: Monitor Machine Code header + structured 0x3A records (length-jumped),
-    terminated strictly by 0-length record.
-  - 0xD3: Tokenized BASIC (CSAVE) traversed line-by-line until 0x0000 pointer.
-  - 0x9C: ASCII sequential files consumed until 0x1A EOF.
-- .t88: Authentic Manuke Station / X88000 24-byte header container format
-  with 12-byte DATA sub-headers and carrier lead-in/gap tags.
+### Format Architecture and Relationshop
+```
++-----------------------------------------------------------------------------------+
+| .t88 Container (Physical Carrier / Container Layer)                               |
+|   [24-Byte Header] -> [Blocks: VERSION, COMMENT, MARK, SPACE, GAP, DATA_1200/300] |
+|   * Carrier lead-ins (MARK/GAP/SPACE) define block intervals and tape carrier.    |
+|   * 12-byte DATA sub-header embeds start tick, tick length, and baud duration.    |
++-----------------------------------------------------------------------------------+
+                                         │
+                   extract_cmt_payload() │ from_cmt_data()
+                                         ▼
++-----------------------------------------------------------------------------------+
+| .cmt Sequential Stream (Logical Demodulated Stream Layer)                         |
+|   * Continuous sequential byte stream directly consumed by BIOS/Monitor ROM.      |
+|   * File boundaries are defined by Protocol Headers or Address Record Syncs:      |
+|     - 0xD3: CSAVE Tokenized BASIC Program (Line-linked table -> 0x0000 pointer)   |
+|     - 0x24: MON Machine Language Header + 0x3A records (terminated by :00)        |
+|     - 0x9C: ASCII Text / Sequential Data (consumed until 0x1A EOF)                |
+|     - 0x3A: Headerless MON O / MON I Stream (: [addr:2] [chk] -> : [len] -> :00)  |
+|     - 0xFF: Custom Machine Language Loaders (e.g. NONTAMA: len + load/exec addr)  |
++-----------------------------------------------------------------------------------+
+```
 
+### Supported Protocols & State Machines:
+- .t88 (Physical Signal / Container Layer):
+    An emulation container capturing the physical cassette signal structure.
+    Consists of a 24-byte ASCII header followed by tagged timing and data blocks:
+  - 0x0103 (MARK): Lead-in carrier tone burst (~2400 Hz high frequency).
+  - 0x0102 (SPACE): Space carrier tone (~1200 Hz low frequency).
+  - 0x0100 (GAP): Silence / unrecorded tape interval.
+  - 0x0101 (DATA): Timing sub-header (12 bytes: start_tick, tick_len, data_len)
+                   plus raw demodulated byte payload.
+  - 0x0010 (COMMENT): UTF-8/ASCII metadata annotations.
+  - 0x0000 (END): Terminal container marker.
+- .cmt (Logical Sequential Tape Stream):
+    The continuous demodulated byte stream presented to the CPU/BIOS I/O state machine.
+    Contains no container framing; boundaries are determined purely by protocol state:
+  - 0xD3: CSAVE Tokenized BASIC Program.
+          Preamble (3-10x 0xD3) + 6-byte filename + inter-block sync tone +
+          linked line table traversed line-by-line until 0x0000 next-pointer.
+  - 0x24: MON Machine Language Header (MON W / MON R).
+          Preamble (3-10x 0x24) + 6-byte filename + 4-byte Start Address Record
+          (: [addr_hi:1] [addr_lo:1] [chk:1]) + length-jumped data records
+          (: [len:1] [data:len] [chk:1]) + 0-length terminator (`: \x00` [chk:1]).
+  - 0x9C: ASCII Sequential File (SAVE / PRINT#).
+          Preamble (3-10x 0x9C) + 6-byte filename + text stream terminated by 0x1A (EOF).
+  - 0x3A: Headerless Monitor Machine Language Records (MON O / MON I).
+          Direct 4-byte Start Address Record + length-jumped data records,
+          terminated strictly by 0-length record (`: \x00`).
+  - 0xFF: Custom Machine Language Loaders (e.g. NONTAMA format).
+          Header preamble (`\xffNONTAMA`) + 6-byte descriptor (load_addr, len, exec_addr) +
+          direct length-jumped payload.
+  
 ### Output of `--help-all`
 ```
 usage: pc88_tape_tools.py [-h] [--test] [--help-all] <command> ...
@@ -29,6 +72,7 @@ options:
 
 Available Subcommands:
   <command>
+    analyze    Analyze tape image structure, programs, baud rate, and metadata
     t2c        Convert .t88 container to raw .cmt tape dump
     c2t        Convert raw .cmt tape dump to .t88 container
     split-cmt  Split multi-file .cmt or .t88 into individual .cmt files
@@ -42,6 +86,16 @@ Tip: Run 'pc88_tape_tools.py <subcommand> --help' (e.g. 'pc88_tape_tools.py spli
 ================================================================================
 DETAILED SUBCOMMAND HELP
 ================================================================================
+
+--- Subcommand: analyze ---
+usage: pc88_tape_tools.py analyze [-h] [-v] input
+
+positional arguments:
+  input          Path to input .t88 or .cmt file to analyze
+
+options:
+  -h, --help     show this help message and exit
+  -v, --verbose  Display full T88 block table and detailed diagnostics
 
 --- Subcommand: t2c ---
 usage: pc88_tape_tools.py t2c [-h] [-o OUTPUT] input
