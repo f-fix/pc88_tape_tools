@@ -7,14 +7,14 @@ Provides parsing, splitting, joining, and bidirectional conversion between the
 multi-file container format (.t88) and raw sequential tape dumps (.cmt).
 
 Supported Protocols & Formats:
-    - N-BASIC (PC-8001), N80-BASIC (PC-8001mkII), N88-BASIC V1/V2 (PC-8801 series)
-    - .cmt: Sequential tape stream using exact BIOS / Monitor ROM state machine:
-        * 0x24: Monitor Machine Code header + structured 0x3A records (length-jumped),
-                terminated strictly by 0-length record.
-        * 0xD3: Tokenized BASIC (CSAVE) traversed line-by-line until 0x0000 pointer.
-        * 0x9C: ASCII sequential files consumed until 0x1A EOF.
-    - .t88: Authentic Manuke Station / X88000 24-byte header container format
-            with 12-byte DATA sub-headers and carrier lead-in/gap tags.
+- N-BASIC (PC-8001), N80-BASIC (PC-8001mkII), N88-BASIC V1/V2 (PC-8801 series)
+- .cmt: Sequential tape stream using exact BIOS / Monitor ROM state machine:
+  - 0x24: Monitor Machine Code header + structured 0x3A records (length-jumped),
+    terminated strictly by 0-length record.
+  - 0xD3: Tokenized BASIC (CSAVE) traversed line-by-line until 0x0000 pointer.
+  - 0x9C: ASCII sequential files consumed until 0x1A EOF.
+- .t88: Authentic Manuke Station / X88000 24-byte header container format
+  with 12-byte DATA sub-headers and carrier lead-in/gap tags.
 
 ## Output of `--help`
 ```
