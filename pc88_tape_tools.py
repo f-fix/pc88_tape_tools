@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NEC PC-8001 / PC-8801 Cassette Tape Format Utility (`pc88_tape_tool.py`).
+"""NEC PC-8001 / PC-8801 Cassette Tape Format Utility (`pc88_tape_tools.py`).
 
 Provides parsing, splitting, joining, and bidirectional conversion between the
 multi-file container format (.t88) and raw sequential tape dumps (.cmt).
@@ -705,7 +705,7 @@ class TestPC88TapeTool(unittest.TestCase):
 def build_arg_parser() -> argparse.ArgumentParser:
     """Builds the command-line argument parser."""
     parser = argparse.ArgumentParser(
-        prog="pc88_tape_tool.py",
+        prog="pc88_tape_tools.py",
         description="NEC PC-8001 / PC-8801 Cassette Tape Format Utility (.t88 / .cmt)",
     )
     parser.add_argument(
