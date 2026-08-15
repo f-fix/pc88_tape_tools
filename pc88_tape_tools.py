@@ -13,9 +13,6 @@ Supported Protocols & Formats:
         * 0x9C: ASCII sequential files consumed until 0x1A EOF.
     - .t88: Authentic Manuke Station / X88000 24-byte header container format
             with 12-byte DATA sub-headers and carrier lead-in/gap tags.
-
-Author: Vintage Japanese Computer Reverse Engineering Specialist
-License: MIT
 """
 
 import argparse
