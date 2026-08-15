@@ -192,7 +192,7 @@ class T88File:
         blocks.append(T88Block(T88Tag.MARK, struct.pack("<II", current_tick, mark_len)))
         current_tick += mark_len
 
-        ticks_per_byte = 44 if baud == 1200 else 88
+        ticks_per_byte = int(round(44 * 1200 / baud)) if baud > 0 else 44
         data_len = len(cmt_data)
         data_ticks = data_len * ticks_per_byte
         data_header = struct.pack("<IIHH", current_tick, data_ticks, data_len, 0x0000)
@@ -559,6 +559,17 @@ class CMTFile:
         return cls(b"".join(chunks))
 
 
+def _extract_payload_or_raw(data: bytes) -> bytes:
+    """Helper to extract CMT payload if data is T88 format, or return raw data."""
+    if len(data) >= 24 and T88File.is_valid_magic(data[:24]):
+        try:
+            t88 = T88File.unpack(io.BytesIO(data))
+            return t88.extract_cmt_payload()
+        except Exception:
+            return data
+    return data
+
+
 def convert_t88_to_cmt(input_path: str, output_path: Optional[str] = None) -> str:
     if output_path is None:
         base, _ = os.path.splitext(input_path)
@@ -577,7 +588,10 @@ def convert_t88_to_cmt(input_path: str, output_path: Optional[str] = None) -> st
 
 
 def convert_cmt_to_t88(
-    input_path: str, output_path: Optional[str] = None, comment: str = ""
+    input_path: str,
+    output_path: Optional[str] = None,
+    comment: str = "",
+    baud: int = 1200,
 ) -> str:
     if output_path is None:
         base, _ = os.path.splitext(input_path)
@@ -586,7 +600,7 @@ def convert_cmt_to_t88(
     with open(input_path, "rb") as f:
         cmt_data = f.read()
 
-    t88 = T88File.from_cmt_data(cmt_data, comment=comment)
+    t88 = T88File.from_cmt_data(cmt_data, comment=comment, baud=baud)
 
     with open(output_path, "wb") as f:
         f.write(t88.pack())
@@ -610,8 +624,9 @@ def split_cmt_file(
     os.makedirs(output_dir, exist_ok=True)
     summary_info: List[Tuple[str, str, int, str]] = []
 
-    for name, ftype, chunk_data in chunks:
-        out_name = name if name.lower().endswith(".cmt") else f"{name}.cmt"
+    for idx, (name, ftype, chunk_data) in enumerate(chunks, start=1):
+        clean_name = name[:-4] if name.lower().endswith(".cmt") else name
+        out_name = f"{idx:02d}_{clean_name}.cmt"
         out_path = os.path.join(output_dir, out_name)
         with open(out_path, "wb") as f:
             f.write(chunk_data)
@@ -620,11 +635,188 @@ def split_cmt_file(
     return summary_info
 
 
+def split_t88_file(
+    input_path: str,
+    output_dir: Optional[str] = None,
+    comment: str = "",
+    baud: Optional[int] = None,
+    default_baud: int = 1200,
+    cmt_baud: Optional[int] = None,
+) -> List[Tuple[str, str, int, str]]:
+    """Splits multi-file .cmt or .t88 into individual numbered .t88 files.
+
+    When input is a .t88 container, preserves original carrier tags (MARK/GAP/SPACE)
+    and per-block baud/timing parameters unless overridden by the `baud` argument.
+    """
+    with open(input_path, "rb") as f:
+        raw_data = f.read()
+
+    if output_dir is None:
+        base_name = os.path.splitext(os.path.basename(input_path))[0]
+        output_dir = f"{base_name}_split"
+
+    os.makedirs(output_dir, exist_ok=True)
+    summary_info: List[Tuple[str, str, int, str]] = []
+
+    if cmt_baud is not None:
+        default_baud = cmt_baud
+
+    # Handle T88 input preserving block structure and timing directly
+    if len(raw_data) >= 24 and T88File.is_valid_magic(raw_data[:24]):
+        try:
+            t88 = T88File.unpack(io.BytesIO(raw_data))
+            file_sections: List[Tuple[str, str, List[T88Block]]] = []
+            pending_carriers: List[T88Block] = []
+            curr_blocks: List[T88Block] = []
+            curr_name = ""
+            curr_type = ""
+            used_names: Dict[str, int] = {}
+
+            for block in t88.blocks:
+                if block.tag in (T88Tag.VERSION, T88Tag.END):
+                    continue
+                elif block.tag == T88Tag.COMMENT:
+                    if not comment:
+                        curr_blocks.append(block)
+                elif block.tag in (T88Tag.MARK, T88Tag.GAP, T88Tag.SPACE):
+                    pending_carriers.append(block)
+                elif block.tag == 0x0101:  # DATA block
+                    payload = b""
+                    if len(block.data) >= 12:
+                        _, _, dlen, _ = struct.unpack("<IIHH", block.data[:12])
+                        payload = block.data[12 : 12 + dlen]
+                    else:
+                        payload = block.data
+
+                    fname, ftype = CMTFile.extract_file_info(payload)
+                    if fname:
+                        if curr_blocks:
+                            uname = CMTFile._dedup_name(curr_name or "part", used_names)
+                            file_sections.append(
+                                (uname, curr_type or "Binary Data", curr_blocks)
+                            )
+                            curr_blocks = []
+                        curr_name = fname
+                        curr_type = ftype
+                        curr_blocks.extend(pending_carriers)
+                        pending_carriers = []
+                        curr_blocks.append(block)
+                    else:
+                        curr_blocks.extend(pending_carriers)
+                        pending_carriers = []
+                        curr_blocks.append(block)
+
+            if curr_blocks:
+                uname = CMTFile._dedup_name(curr_name or "part", used_names)
+                file_sections.append((uname, curr_type or "Binary Data", curr_blocks))
+
+            if file_sections:
+                for idx, (fname, ftype, blocks) in enumerate(file_sections, start=1):
+                    new_blocks: List[T88Block] = []
+                    new_blocks.append(
+                        T88Block(T88Tag.VERSION, struct.pack("<H", 0x0100))
+                    )
+                    if comment:
+                        new_blocks.append(
+                            T88Block(
+                                T88Tag.COMMENT,
+                                comment.encode("utf-8", errors="ignore"),
+                            )
+                        )
+
+                    timing_blocks = [
+                        b
+                        for b in blocks
+                        if b.tag in (T88Tag.GAP, T88Tag.SPACE, T88Tag.MARK, 0x0101)
+                    ]
+                    min_tick = 0
+                    for tb in timing_blocks:
+                        if len(tb.data) >= 8:
+                            st, _ = struct.unpack("<II", tb.data[:8])
+                            min_tick = st
+                            break
+
+                    curr_tick = 0
+                    for b in blocks:
+                        if b.tag in (T88Tag.GAP, T88Tag.SPACE, T88Tag.MARK):
+                            if len(b.data) >= 8:
+                                st, lt = struct.unpack("<II", b.data[:8])
+                                if baud is None:
+                                    new_st = max(0, st - min_tick)
+                                else:
+                                    new_st = curr_tick
+                                    curr_tick += lt
+                                new_b_data = struct.pack("<II", new_st, lt) + b.data[8:]
+                                new_blocks.append(T88Block(b.tag, new_b_data))
+                            else:
+                                new_blocks.append(T88Block(b.tag, b.data))
+                        elif b.tag == 0x0101:  # DATA block
+                            if len(b.data) >= 12:
+                                st, lt, dlen, res = struct.unpack("<IIHH", b.data[:12])
+                                payload = b.data[12 : 12 + dlen]
+                                if baud is None:
+                                    new_st = max(0, st - min_tick)
+                                    new_lt = lt
+                                else:
+                                    ticks_per_byte = (
+                                        int(round(44 * 1200 / baud)) if baud > 0 else 44
+                                    )
+                                    new_lt = dlen * ticks_per_byte
+                                    new_st = curr_tick
+                                    curr_tick += new_lt
+                                new_b_data = (
+                                    struct.pack("<IIHH", new_st, new_lt, dlen, res)
+                                    + payload
+                                )
+                                new_blocks.append(T88Block(b.tag, new_b_data))
+                            else:
+                                new_blocks.append(T88Block(b.tag, b.data))
+                        else:
+                            new_blocks.append(T88Block(b.tag, b.data))
+
+                    new_blocks.append(T88Block(T88Tag.END, b""))
+                    split_t88 = T88File(
+                        magic=t88.magic, version=t88.version, blocks=new_blocks
+                    )
+                    t88_bytes = split_t88.pack()
+
+                    clean_name = fname[:-4] if fname.lower().endswith(".t88") else fname
+                    out_name = f"{idx:02d}_{clean_name}.t88"
+                    out_path = os.path.join(output_dir, out_name)
+                    with open(out_path, "wb") as out_f:
+                        out_f.write(t88_bytes)
+                    summary_info.append((fname, ftype, len(t88_bytes), out_path))
+
+                return summary_info
+        except Exception:
+            pass
+
+    # Fallback for raw CMT input stream
+    cmt = CMTFile(raw_data)
+    chunks = cmt.split()
+    effective_baud = baud if baud is not None else default_baud
+
+    for idx, (name, ftype, chunk_data) in enumerate(chunks, start=1):
+        t88_obj = T88File.from_cmt_data(
+            chunk_data, comment=comment, baud=effective_baud
+        )
+        t88_bytes = t88_obj.pack()
+        clean_name = name[:-4] if name.lower().endswith(".t88") else name
+        out_name = f"{idx:02d}_{clean_name}.t88"
+        out_path = os.path.join(output_dir, out_name)
+        with open(out_path, "wb") as out_f:
+            out_f.write(t88_bytes)
+        summary_info.append((name, ftype, len(t88_bytes), out_path))
+
+    return summary_info
+
+
 def join_cmt_files(input_paths: List[str], output_path: str) -> str:
     chunks: List[bytes] = []
     for path in input_paths:
         with open(path, "rb") as f:
-            chunks.append(f.read())
+            data = f.read()
+        chunks.append(_extract_payload_or_raw(data))
 
     joined = CMTFile.join(chunks)
 
@@ -634,6 +826,139 @@ def join_cmt_files(input_paths: List[str], output_path: str) -> str:
 
     with open(output_path, "wb") as f:
         f.write(joined.data)
+
+    return output_path
+
+
+def join_t88_files(
+    input_paths: List[str],
+    output_path: str,
+    comment: str = "",
+    baud: Optional[int] = None,
+    default_baud: int = 1200,
+    cmt_baud: Optional[int] = None,
+) -> str:
+    """Merges multiple files (.t88 or .cmt) into a consolidated .t88 container.
+
+    When merging .t88 files, preserves original block tags, carrier sequences,
+    and timing characteristics unless overridden by the `baud` parameter.
+    For raw .cmt inputs, uses `cmt_baud` / `default_baud` without altering the
+    timing of .t88 inputs.
+    """
+    combined_blocks: List[T88Block] = []
+    combined_blocks.append(T88Block(T88Tag.VERSION, struct.pack("<H", 0x0100)))
+
+    if comment:
+        combined_blocks.append(
+            T88Block(T88Tag.COMMENT, comment.encode("utf-8", errors="ignore"))
+        )
+
+    if cmt_baud is not None:
+        default_baud = cmt_baud
+
+    current_tick = 0
+
+    for path in input_paths:
+        with open(path, "rb") as f:
+            data = f.read()
+
+        is_t88 = len(data) >= 24 and T88File.is_valid_magic(data[:24])
+
+        if is_t88:
+            try:
+                t88 = T88File.unpack(io.BytesIO(data))
+                file_blocks = [
+                    b for b in t88.blocks if b.tag not in (T88Tag.VERSION, T88Tag.END)
+                ]
+
+                min_tick = 0
+                for b in file_blocks:
+                    if b.tag in (T88Tag.GAP, T88Tag.SPACE, T88Tag.MARK, 0x0101):
+                        if len(b.data) >= 8:
+                            st, _ = struct.unpack("<II", b.data[:8])
+                            min_tick = st
+                            break
+
+                file_start_tick = current_tick
+                file_max_end = current_tick
+
+                for b in file_blocks:
+                    if b.tag in (T88Tag.GAP, T88Tag.SPACE, T88Tag.MARK):
+                        if len(b.data) >= 8:
+                            st, lt = struct.unpack("<II", b.data[:8])
+                            if baud is None:
+                                new_st = file_start_tick + max(0, st - min_tick)
+                                file_max_end = max(file_max_end, new_st + lt)
+                            else:
+                                new_st = current_tick
+                                current_tick += lt
+                                file_max_end = current_tick
+                            new_b_data = struct.pack("<II", new_st, lt) + b.data[8:]
+                            combined_blocks.append(T88Block(b.tag, new_b_data))
+                        else:
+                            combined_blocks.append(T88Block(b.tag, b.data))
+
+                    elif b.tag == 0x0101:  # DATA block
+                        if len(b.data) >= 12:
+                            st, lt, dlen, res = struct.unpack("<IIHH", b.data[:12])
+                            payload = b.data[12 : 12 + dlen]
+                            if baud is None:
+                                new_st = file_start_tick + max(0, st - min_tick)
+                                new_lt = lt
+                                file_max_end = max(file_max_end, new_st + new_lt)
+                            else:
+                                ticks_per_byte = (
+                                    int(round(44 * 1200 / baud)) if baud > 0 else 44
+                                )
+                                new_lt = dlen * ticks_per_byte
+                                new_st = current_tick
+                                current_tick += new_lt
+                                file_max_end = current_tick
+                            new_b_data = (
+                                struct.pack("<IIHH", new_st, new_lt, dlen, res)
+                                + payload
+                            )
+                            combined_blocks.append(T88Block(b.tag, new_b_data))
+                        else:
+                            combined_blocks.append(T88Block(b.tag, b.data))
+
+                    elif b.tag == T88Tag.COMMENT:
+                        if not comment:
+                            combined_blocks.append(T88Block(b.tag, b.data))
+                    else:
+                        combined_blocks.append(T88Block(b.tag, b.data))
+
+                current_tick = file_max_end
+                continue
+            except Exception:
+                pass
+
+        # Input is raw CMT data
+        effective_cmt_baud = baud if baud is not None else default_baud
+        ticks_per_byte = (
+            int(round(44 * 1200 / effective_cmt_baud)) if effective_cmt_baud > 0 else 44
+        )
+        mark_len = 9600
+        combined_blocks.append(
+            T88Block(T88Tag.MARK, struct.pack("<II", current_tick, mark_len))
+        )
+        current_tick += mark_len
+
+        data_len = len(data)
+        data_ticks = data_len * ticks_per_byte
+        data_header = struct.pack("<IIHH", current_tick, data_ticks, data_len, 0x0000)
+        combined_blocks.append(T88Block(0x0101, data_header + data))
+        current_tick += data_ticks
+
+    combined_blocks.append(T88Block(T88Tag.END, b""))
+
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    joined_t88 = T88File(blocks=combined_blocks)
+    with open(output_path, "wb") as f:
+        f.write(joined_t88.pack())
 
     return output_path
 
@@ -730,6 +1055,23 @@ class TestPC88TapeTool(unittest.TestCase):
         t88_reencoded = T88File.from_cmt_data(cmt_extracted)
         self.assertEqual(t88_reencoded.extract_cmt_payload(), self.combined_cmt)
 
+    def test_baud_rate_override(self) -> None:
+        """Tests overriding baud rate when creating T88 containers."""
+        t88_1200 = T88File.from_cmt_data(self.ml_file, baud=1200)
+        t88_300 = T88File.from_cmt_data(self.ml_file, baud=300)
+
+        # 1200 baud -> 44 ticks/byte; 300 baud -> 176 ticks/byte
+        data_block_1200 = [b for b in t88_1200.blocks if b.tag == 0x0101][0]
+        data_block_300 = [b for b in t88_300.blocks if b.tag == 0x0101][0]
+
+        _, ticks_1200, dlen_1200, _ = struct.unpack("<IIHH", data_block_1200.data[:12])
+        _, ticks_300, dlen_300, _ = struct.unpack("<IIHH", data_block_300.data[:12])
+
+        self.assertEqual(dlen_1200, len(self.ml_file))
+        self.assertEqual(dlen_300, len(self.ml_file))
+        self.assertEqual(ticks_1200, len(self.ml_file) * 44)
+        self.assertEqual(ticks_300, len(self.ml_file) * 176)
+
     def test_split_and_join_cmt(self) -> None:
         """Tests splitting multi-format CMT stream and joining them back."""
         cmt_file = CMTFile(self.combined_cmt)
@@ -789,19 +1131,148 @@ class TestPC88TapeTool(unittest.TestCase):
         self.assertEqual(split_items[0][0], "BIN001")
         self.assertEqual(split_items[1][0], "PROG01")
 
+    def test_t88_to_t88_split_and_join_preserves_timing_and_carrier_blocks(
+        self,
+    ) -> None:
+        """Tests that T88 -> T88 split and join preserves original timing and carrier blocks without CMT loss."""
+        h1 = struct.pack("<IIHH", 9600, len(self.ml_file) * 44, len(self.ml_file), 0)
+        h2 = struct.pack(
+            "<IIHH", 25000, len(self.basic_file) * 176, len(self.basic_file), 0
+        )  # 300 baud
+        blocks = [
+            T88Block(T88Tag.VERSION, struct.pack("<H", 0x0100)),
+            T88Block(T88Tag.MARK, struct.pack("<II", 0, 9600)),
+            T88Block(T88Tag.DATA_1200, h1 + self.ml_file),
+            T88Block(T88Tag.MARK, struct.pack("<II", 20000, 5000)),
+            T88Block(T88Tag.DATA_300, h2 + self.basic_file),
+            T88Block(T88Tag.END, b""),
+        ]
+        t88_orig = T88File(blocks=blocks)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            t88_in = os.path.join(tmpdir, "input.t88")
+            split_dir = os.path.join(tmpdir, "split_t88")
+            rejoined_out = os.path.join(tmpdir, "rejoined.t88")
+
+            with open(t88_in, "wb") as f:
+                f.write(t88_orig.pack())
+
+            # Split without overriding baud -> should preserve individual baud rates & MARK tags
+            split_info = split_t88_file(t88_in, split_dir, baud=None)
+            self.assertEqual(len(split_info), 2)
+            self.assertEqual(os.path.basename(split_info[0][3]), "01_BIN001.t88")
+            self.assertEqual(os.path.basename(split_info[1][3]), "02_PROG01.t88")
+
+            # Check individual split files
+            with open(split_info[0][3], "rb") as f:
+                t88_part1 = T88File.unpack(io.BytesIO(f.read()))
+            with open(split_info[1][3], "rb") as f:
+                t88_part2 = T88File.unpack(io.BytesIO(f.read()))
+
+            # Verify carrier blocks were preserved in split T88 files
+            self.assertTrue(any(b.tag == T88Tag.MARK for b in t88_part1.blocks))
+            self.assertTrue(any(b.tag == T88Tag.MARK for b in t88_part2.blocks))
+
+            # Verify baud rate preservation (44 ticks/byte for part 1, 176 ticks/byte for part 2)
+            dblock1 = [b for b in t88_part1.blocks if b.tag == 0x0101][0]
+            dblock2 = [b for b in t88_part2.blocks if b.tag == 0x0101][0]
+            _, ticks1, dlen1, _ = struct.unpack("<IIHH", dblock1.data[:12])
+            _, ticks2, dlen2, _ = struct.unpack("<IIHH", dblock2.data[:12])
+            self.assertEqual(ticks1, dlen1 * 44)
+            self.assertEqual(ticks2, dlen2 * 176)
+
+            # Rejoin without baud override
+            res_join = join_t88_files(
+                [split_info[0][3], split_info[1][3]], rejoined_out, baud=None
+            )
+            with open(res_join, "rb") as f:
+                t88_rejoined = T88File.unpack(io.BytesIO(f.read()))
+
+            self.assertEqual(
+                t88_rejoined.extract_cmt_payload(), t88_orig.extract_cmt_payload()
+            )
+
+    def test_join_t88_mixed_inputs_with_cmt_baud(self) -> None:
+        """Tests that join-t88 preserves T88 timings while applying cmt_baud specifically to CMT inputs."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # 1. Create a 300-baud T88 file
+            t88_300 = T88File.from_cmt_data(self.basic_file, baud=300)
+            p_t88 = os.path.join(tmpdir, "part1.t88")
+            with open(p_t88, "wb") as f:
+                f.write(t88_300.pack())
+
+            # 2. Create a raw CMT file
+            p_cmt = os.path.join(tmpdir, "part2.cmt")
+            with open(p_cmt, "wb") as f:
+                f.write(self.ml_file)
+
+            # 3. Join with cmt_baud=600, baud=None
+            p_joined = os.path.join(tmpdir, "joined_mixed.t88")
+            join_t88_files([p_t88, p_cmt], p_joined, baud=None, cmt_baud=600)
+
+            with open(p_joined, "rb") as f:
+                joined_t88 = T88File.unpack(io.BytesIO(f.read()))
+
+            data_blocks = [b for b in joined_t88.blocks if b.tag == 0x0101]
+            self.assertEqual(len(data_blocks), 2)
+
+            # Part 1 (from T88) should maintain 300 baud (176 ticks/byte)
+            _, ticks1, dlen1, _ = struct.unpack("<IIHH", data_blocks[0].data[:12])
+            self.assertEqual(ticks1, dlen1 * 176)
+
+            # Part 2 (from CMT) should use cmt_baud=600 (88 ticks/byte)
+            _, ticks2, dlen2, _ = struct.unpack("<IIHH", data_blocks[1].data[:12])
+            self.assertEqual(ticks2, dlen2 * 88)
+
+    def test_t88_to_t88_split_and_join_with_baud_override(self) -> None:
+        """Tests that T88 -> T88 split and join recalculates timing when baud is overridden."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            t88_in = os.path.join(tmpdir, "input.t88")
+            split_dir = os.path.join(tmpdir, "split_t88")
+            rejoined_out = os.path.join(tmpdir, "rejoined.t88")
+
+            # Generate 1200 baud input
+            t88_orig = T88File.from_cmt_data(self.combined_cmt, baud=1200)
+            with open(t88_in, "wb") as f:
+                f.write(t88_orig.pack())
+
+            # Split with override to 300 baud
+            split_info = split_t88_file(t88_in, split_dir, baud=300)
+            for _, _, _, out_path in split_info:
+                with open(out_path, "rb") as f:
+                    part = T88File.unpack(io.BytesIO(f.read()))
+                dblock = [b for b in part.blocks if b.tag == 0x0101][0]
+                _, ticks, dlen, _ = struct.unpack("<IIHH", dblock.data[:12])
+                self.assertEqual(ticks, dlen * 176)
+
+            # Rejoin with override to 1200 baud
+            split_files = [item[3] for item in split_info]
+            res_join = join_t88_files(split_files, rejoined_out, baud=1200)
+            with open(res_join, "rb") as f:
+                rejoined = T88File.unpack(io.BytesIO(f.read()))
+
+            for b in [b for b in rejoined.blocks if b.tag == 0x0101]:
+                _, ticks, dlen, _ = struct.unpack("<IIHH", b.data[:12])
+                self.assertEqual(ticks, dlen * 44)
+
     def test_cli_file_operations(self) -> None:
-        """Tests disk file operations for convert, split, and join."""
+        """Tests disk file operations for convert, split, and join (both CMT and T88)."""
         with tempfile.TemporaryDirectory() as tmpdir:
             cmt_in = os.path.join(tmpdir, "input.cmt")
             t88_out = os.path.join(tmpdir, "output.t88")
             cmt_out = os.path.join(tmpdir, "output.cmt")
             split_dir = os.path.join(tmpdir, "split_files")
+            split_t88_dir = os.path.join(tmpdir, "split_t88_files")
             joined_out = os.path.join(tmpdir, "joined.cmt")
+            joined_t88_out = os.path.join(tmpdir, "joined.t88")
 
             with open(cmt_in, "wb") as f:
                 f.write(self.combined_cmt)
 
-            res_t88 = convert_cmt_to_t88(cmt_in, t88_out, comment="CLI Temp Test")
+            # c2t and t2c
+            res_t88 = convert_cmt_to_t88(
+                cmt_in, t88_out, comment="CLI Temp Test", baud=1200
+            )
             self.assertTrue(os.path.exists(res_t88))
 
             res_cmt = convert_t88_to_cmt(t88_out, cmt_out)
@@ -810,15 +1281,36 @@ class TestPC88TapeTool(unittest.TestCase):
             with open(res_cmt, "rb") as f:
                 self.assertEqual(f.read(), self.combined_cmt)
 
+            # split-cmt (verifying 2-digit index prefixing)
             split_info = split_cmt_file(cmt_in, split_dir)
             self.assertEqual(len(split_info), 3)
+            self.assertEqual(os.path.basename(split_info[0][3]), "01_BIN001.cmt")
+            self.assertEqual(os.path.basename(split_info[1][3]), "02_PROG01.cmt")
+            self.assertEqual(os.path.basename(split_info[2][3]), "03_TEXT01.cmt")
 
+            # join-cmt
             split_files = [item[3] for item in split_info]
             res_join = join_cmt_files(split_files, joined_out)
             self.assertTrue(os.path.exists(res_join))
 
             with open(res_join, "rb") as f:
                 self.assertEqual(f.read(), self.combined_cmt)
+
+            # split-t88 (verifying 2-digit index prefixing & T88 generation)
+            split_t88_info = split_t88_file(cmt_in, split_t88_dir, baud=1200)
+            self.assertEqual(len(split_t88_info), 3)
+            self.assertEqual(os.path.basename(split_t88_info[0][3]), "01_BIN001.t88")
+            self.assertEqual(os.path.basename(split_t88_info[1][3]), "02_PROG01.t88")
+            self.assertEqual(os.path.basename(split_t88_info[2][3]), "03_TEXT01.t88")
+
+            # join-t88
+            split_t88_files = [item[3] for item in split_t88_info]
+            res_t88_join = join_t88_files(split_t88_files, joined_t88_out, baud=1200)
+            self.assertTrue(os.path.exists(res_t88_join))
+
+            with open(res_t88_join, "rb") as f:
+                unpacked_join = T88File.unpack(io.BytesIO(f.read()))
+                self.assertEqual(unpacked_join.extract_cmt_payload(), self.combined_cmt)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -851,23 +1343,92 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="",
         help="Optional comment metadata string embedded in T88 file",
     )
-
-    p_split = subparsers.add_parser(
-        "split-cmt", help="Split multi-file .cmt or .t88 into individual files"
+    p_c2t.add_argument(
+        "-b",
+        "--baud",
+        type=int,
+        default=1200,
+        help="Baud rate for output T88 file (default: 1200)",
     )
-    p_split.add_argument("input", help="Path to input .cmt or .t88 file")
-    p_split.add_argument(
+
+    p_split_cmt = subparsers.add_parser(
+        "split-cmt", help="Split multi-file .cmt or .t88 into individual .cmt files"
+    )
+    p_split_cmt.add_argument("input", help="Path to input .cmt or .t88 file")
+    p_split_cmt.add_argument(
         "-o",
         "--output-dir",
         help="Output directory for split files (optional)",
     )
 
-    p_join = subparsers.add_parser(
-        "join-cmt", help="Join multiple .cmt files into a single .cmt file"
+    p_split_t88 = subparsers.add_parser(
+        "split-t88", help="Split multi-file .cmt or .t88 into individual .t88 files"
     )
-    p_join.add_argument("inputs", nargs="+", help="Input .cmt files to concatenate")
-    p_join.add_argument(
+    p_split_t88.add_argument("input", help="Path to input .cmt or .t88 file")
+    p_split_t88.add_argument(
+        "-o",
+        "--output-dir",
+        help="Output directory for split files (optional)",
+    )
+    p_split_t88.add_argument(
+        "-b",
+        "--baud",
+        type=int,
+        default=None,
+        help="Override baud rate for output .t88 files (preserves original timing by default for .t88)",
+    )
+    p_split_t88.add_argument(
+        "--cmt-baud",
+        "--default-baud",
+        dest="cmt_baud",
+        type=int,
+        default=1200,
+        help="Default baud rate when input is a raw .cmt file (default: 1200)",
+    )
+    p_split_t88.add_argument(
+        "--comment",
+        default="",
+        help="Optional comment metadata string embedded in T88 files",
+    )
+
+    p_join_cmt = subparsers.add_parser(
+        "join-cmt", help="Join multiple files into a single .cmt file"
+    )
+    p_join_cmt.add_argument(
+        "inputs", nargs="+", help="Input .cmt or .t88 files to concatenate"
+    )
+    p_join_cmt.add_argument(
         "-o", "--output", required=True, help="Path to output merged .cmt file"
+    )
+
+    p_join_t88 = subparsers.add_parser(
+        "join-t88", help="Join multiple files into a single .t88 container"
+    )
+    p_join_t88.add_argument(
+        "inputs", nargs="+", help="Input .cmt or .t88 files to concatenate"
+    )
+    p_join_t88.add_argument(
+        "-o", "--output", required=True, help="Path to output merged .t88 file"
+    )
+    p_join_t88.add_argument(
+        "-b",
+        "--baud",
+        type=int,
+        default=None,
+        help="Override baud rate for ALL output chunks (both .t88 and .cmt inputs)",
+    )
+    p_join_t88.add_argument(
+        "--cmt-baud",
+        "--default-baud",
+        dest="cmt_baud",
+        type=int,
+        default=1200,
+        help="Default baud rate to use for raw .cmt inputs (default: 1200). Does not affect .t88 inputs.",
+    )
+    p_join_t88.add_argument(
+        "--comment",
+        default="",
+        help="Optional comment metadata string embedded in T88 file",
     )
 
     return parser
@@ -895,7 +1456,9 @@ def main() -> None:
             print(f"[SUCCESS] Converted {args.input} -> {out_file}")
 
         elif args.command == "c2t":
-            out_file = convert_cmt_to_t88(args.input, args.output, comment=args.comment)
+            out_file = convert_cmt_to_t88(
+                args.input, args.output, comment=args.comment, baud=args.baud
+            )
             print(f"[SUCCESS] Converted {args.input} -> {out_file}")
 
         elif args.command == "split-cmt":
@@ -909,8 +1472,35 @@ def main() -> None:
                 print(f"{idx:<3} | {fname:<12} | {ftype:<32} | {size:<12} | {path}")
             print("-" * 90)
 
+        elif args.command == "split-t88":
+            summary = split_t88_file(
+                args.input,
+                args.output_dir,
+                comment=args.comment,
+                baud=args.baud,
+                cmt_baud=args.cmt_baud,
+            )
+            print(f"\n[SUCCESS] Split '{args.input}' into {len(summary)} file(s):\n")
+            print(
+                f"{'#':<3} | {'Filename':<12} | {'File Format / Type':<32} | {'Size (Bytes)':<12} | Saved Path"
+            )
+            print("-" * 90)
+            for idx, (fname, ftype, size, path) in enumerate(summary, start=1):
+                print(f"{idx:<3} | {fname:<12} | {ftype:<32} | {size:<12} | {path}")
+            print("-" * 90)
+
         elif args.command == "join-cmt":
             out_file = join_cmt_files(args.inputs, args.output)
+            print(f"[SUCCESS] Merged {len(args.inputs)} file(s) -> {out_file}")
+
+        elif args.command == "join-t88":
+            out_file = join_t88_files(
+                args.inputs,
+                args.output,
+                comment=args.comment,
+                baud=args.baud,
+                cmt_baud=args.cmt_baud,
+            )
             print(f"[SUCCESS] Merged {len(args.inputs)} file(s) -> {out_file}")
 
     except Exception as err:
