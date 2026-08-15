@@ -16,7 +16,7 @@ Supported Protocols & Formats:
 - .t88: Authentic Manuke Station / X88000 24-byte header container format
   with 12-byte DATA sub-headers and carrier lead-in/gap tags.
 
-## Output of `--help`
+### Output of `--help`
 ```
 usage: pc88_tape_tool.py [-h] [--test] {t2c,c2t,split-cmt,join-cmt} ...
 
