@@ -214,12 +214,7 @@ class CMTFile:
         0x24: "MON Machine Language Header (0x24)",
     }
 
-    # Canonical CSAVE/monitor sync-tone length. A preamble run at least this
-    # long is treated as a genuine sync burst (real tape lead-in), so a
-    # null-padded name following it is trusted. Shorter runs (3-4 bytes,
-    # common as coincidental repeats inside binary payload data) are NOT
-    # trusted with null-padding, since that combination is what produces
-    # false-positive header matches inside machine-code data.
+    # Canonical CSAVE/monitor sync-tone length.
     CANONICAL_SYNC_LEN: int = 8
 
     def __init__(self, data: bytes = b"") -> None:
@@ -229,16 +224,7 @@ class CMTFile:
     def is_valid_cassette_filename(
         cls, name_bytes: bytes, allow_null: bool = False
     ) -> bool:
-        """Verifies if a 6-byte sequence forms a valid space-padded PC-8001/PC-8801 cassette filename.
-
-        allow_null: permits trailing/embedded 0x00 padding bytes in the name
-        (some real tapes null-pad short names, e.g. "DOOR\x00\x00" instead of
-        space-padding). This must only be set true by callers who have already
-        confirmed a long, canonical preamble sync run (>= CANONICAL_SYNC_LEN)
-        precedes the candidate name -- short/ambiguous sync runs are far more
-        likely to be coincidental byte patterns inside binary payload data, and
-        allowing null bytes there causes false-positive header detection.
-        """
+        """Verifies if a 6-byte sequence forms a valid space-padded PC-8001/PC-8801 cassette filename."""
         if len(name_bytes) != 6:
             return False
         ok_byte = (
@@ -341,13 +327,23 @@ class CMTFile:
                             (uname, curr_type or "Binary Data", b"".join(curr_chunks))
                         )
 
-                    return results
+                    # If multiple files were identified from T88 blocks, return them directly
+                    if len(results) > 1 or (
+                        results and not self.extract_file_info(data_payloads[0])[0]
+                    ):
+                        return results
             except Exception:
                 pass
 
         # Raw CMT Stream state machine:
-        # State HUNT_HEADER -> State PARSE_BODY (following length jumps & terminator rules)
         buf = self.data
+        if len(buf) >= 24 and T88File.is_valid_magic(buf[:24]):
+            try:
+                t88_obj = T88File.unpack(io.BytesIO(buf))
+                buf = t88_obj.extract_cmt_payload()
+            except Exception:
+                pass
+
         n = len(buf)
         pos = 0
         entries: List[Tuple[str, str, bytes]] = []
@@ -395,7 +391,7 @@ class CMTFile:
                 i += 1
 
             if preamble_pos == -1:
-                # No more headers in stream; append remainder
+                # No more headers in stream; append remainder to the last file
                 if pos < n:
                     if entries:
                         p_name, p_type, p_data = entries[-1]
@@ -404,7 +400,7 @@ class CMTFile:
                         entries.append(("part_001", "Raw Data / Unknown", buf[pos:]))
                 break
 
-            # If there were orphan bytes before this header, attach to previous entry
+            # If there were bytes before this header, attach to previous entry without loss
             if preamble_pos > pos:
                 if entries:
                     p_name, p_type, p_data = entries[-1]
@@ -421,13 +417,11 @@ class CMTFile:
                 rec_p = body_start
                 file_end = n
                 while rec_p < n:
-                    # Find start of next record (0x3A ':')
                     colon_pos = buf.find(b"\x3a", rec_p)
                     if colon_pos == -1:
                         file_end = n
                         break
 
-                    # Advance past preamble 0x3A sync bytes to the actual record start
                     while colon_pos + 1 < n and buf[colon_pos + 1] == 0x3A:
                         colon_pos += 1
 
@@ -448,7 +442,6 @@ class CMTFile:
                     if colon_pos + 4 <= n:
                         rlen = buf[colon_pos + 3]
                         if 0 < rlen <= 255:
-                            # Jump directly over the entire payload and checksum
                             rec_p = colon_pos + 1 + 2 + 1 + rlen + 1
                             continue
 
@@ -461,57 +454,27 @@ class CMTFile:
 
             # 2. Tokenized BASIC Program (0xD3) - Line-by-line pointer traversal
             elif preamble_byte == 0xD3:
-                # BASIC has two ROM-compatible layouts in real CMT dumps:
-                #
-                #   1) CSAVE streams with a second D3 sync run before the
-                #      linked BASIC lines.
-                #   2) N-BASIC V1 streams where the linked-line area follows
-                #      the filename immediately (no second D3 run).
-                #
-                # The old parser searched for the second sync run, so it
-                # consumed the entire V1 file as one BASIC file.  Treat this
-                # as a small state machine: consume an optional sync state,
-                # then walk the linked-list line records until the zero
-                # pointer terminator.
                 file_end = n
                 curr_p = body_start
 
-                # STATE: BASIC_SYNC -- optional carrier/CSAVE sync bytes.
                 if curr_p + 3 <= n and buf[curr_p : curr_p + 3] == b"\xd3" * 3:
                     while curr_p < n and buf[curr_p] == 0xD3:
                         curr_p += 1
 
-                # STATE: BASIC_LINES -- [next-pointer:2][line-number:2]
-                # followed by tokenized text terminated by 0x00.  The
-                # next-pointer is a RAM address, so it is deliberately not
-                # used as a file offset.
                 line_count = 0
                 while curr_p + 2 <= n:
                     next_ptr = buf[curr_p] | (buf[curr_p + 1] << 8)
-
-                    # STATE: BASIC_DONE
                     if next_ptr == 0x0000:
                         file_end = curr_p + 2
                         break
-
-                    # A real BASIC line has a four-byte fixed prefix:
-                    # next pointer + line number.
                     if curr_p + 4 > n:
                         break
-
-                    # STATE: BASIC_TEXT -- consume through the line's
-                    # terminating zero byte, then return to BASIC_LINES.
                     line_zero = buf.find(b"\x00", curr_p + 4)
                     if line_zero == -1:
                         break
-
                     curr_p = line_zero + 1
                     line_count += 1
 
-                # If the direct layout did not produce a linked-line
-                # terminator, retain the old conservative behavior: a D3
-                # sync may occur later in the stream, but only accept it if
-                # the linked-list walk actually reaches a terminator.
                 if file_end == n and line_count == 0:
                     data_p = buf.find(b"\xd3" * 3, body_start)
                     if data_p != -1:
@@ -571,6 +534,7 @@ def _extract_payload_or_raw(data: bytes) -> bytes:
 
 
 def convert_t88_to_cmt(input_path: str, output_path: Optional[str] = None) -> str:
+    """Converts .t88 container to raw .cmt tape dump with 100% byte-exact payload preservation."""
     if output_path is None:
         base, _ = os.path.splitext(input_path)
         output_path = f"{base}.cmt"
@@ -593,6 +557,7 @@ def convert_cmt_to_t88(
     comment: str = "",
     baud: int = 1200,
 ) -> str:
+    """Converts raw .cmt tape dump to .t88 container format."""
     if output_path is None:
         base, _ = os.path.splitext(input_path)
         output_path = f"{base}.t88"
@@ -611,6 +576,7 @@ def convert_cmt_to_t88(
 def split_cmt_file(
     input_path: str, output_dir: Optional[str] = None
 ) -> List[Tuple[str, str, int, str]]:
+    """Splits multi-file .cmt or .t88 into individual numbered .cmt files."""
     with open(input_path, "rb") as f:
         tape_data = f.read()
 
@@ -661,7 +627,6 @@ def split_t88_file(
     if cmt_baud is not None:
         default_baud = cmt_baud
 
-    # Handle T88 input preserving block structure and timing directly
     if len(raw_data) >= 24 and T88File.is_valid_magic(raw_data[:24]):
         try:
             t88 = T88File.unpack(io.BytesIO(raw_data))
@@ -707,10 +672,15 @@ def split_t88_file(
                         curr_blocks.append(block)
 
             if curr_blocks:
+                curr_blocks.extend(pending_carriers)
+                pending_carriers = []
                 uname = CMTFile._dedup_name(curr_name or "part", used_names)
                 file_sections.append((uname, curr_type or "Binary Data", curr_blocks))
 
-            if file_sections:
+            # If discrete T88 block sequences exist for each file, output them directly
+            if len(file_sections) > 1 or (
+                file_sections and len(CMTFile(t88.extract_cmt_payload()).split()) <= 1
+            ):
                 for idx, (fname, ftype, blocks) in enumerate(file_sections, start=1):
                     new_blocks: List[T88Block] = []
                     new_blocks.append(
@@ -791,8 +761,9 @@ def split_t88_file(
         except Exception:
             pass
 
-    # Fallback for raw CMT input stream
-    cmt = CMTFile(raw_data)
+    # Stream-level split for raw CMT or multi-file single-DATA-block containers
+    raw_cmt = _extract_payload_or_raw(raw_data)
+    cmt = CMTFile(raw_cmt)
     chunks = cmt.split()
     effective_baud = baud if baud is not None else default_baud
 
@@ -812,6 +783,7 @@ def split_t88_file(
 
 
 def join_cmt_files(input_paths: List[str], output_path: str) -> str:
+    """Merges multiple files into a single concatenated .cmt file."""
     chunks: List[bytes] = []
     for path in input_paths:
         with open(path, "rb") as f:
@@ -838,13 +810,7 @@ def join_t88_files(
     default_baud: int = 1200,
     cmt_baud: Optional[int] = None,
 ) -> str:
-    """Merges multiple files (.t88 or .cmt) into a consolidated .t88 container.
-
-    When merging .t88 files, preserves original block tags, carrier sequences,
-    and timing characteristics unless overridden by the `baud` parameter.
-    For raw .cmt inputs, uses `cmt_baud` / `default_baud` without altering the
-    timing of .t88 inputs.
-    """
+    """Merges multiple files (.t88 or .cmt) into a consolidated .t88 container."""
     combined_blocks: List[T88Block] = []
     combined_blocks.append(T88Block(T88Tag.VERSION, struct.pack("<H", 0x0100)))
 
@@ -967,7 +933,7 @@ class TestPC88TapeTool(unittest.TestCase):
     """Authentic protocol-verified unit tests for PC-8001 / PC-8801 tape operations."""
 
     def setUp(self) -> None:
-        """Sets up realistic mock CMT byte streams for all three formats."""
+        """Sets up realistic mock CMT byte streams for all formats."""
         # 1. Machine Language (0x24 Header + structured 0x3A records with 0-length terminator)
         self.ml_file = (
             (b"\x24" * 10 + b"BIN001" + b"\x00\x80\x00\x80")
@@ -995,10 +961,22 @@ class TestPC88TapeTool(unittest.TestCase):
 
         self.combined_cmt = self.ml_file + self.basic_file + self.ascii_file
 
-        # 4. Null-padded CSAVE Program (short name, zero-padded instead of
-        # space-padded) preceded by a full canonical sync run. Regression
-        # test for a real-world tape ("DOOR" saved in N-BASIC V1 mode) that
-        # a naive space-only filename validator fails to recognize at all.
+        # 4. Multi-ML tape: Three consecutive MON R files
+        self.ml_file_2 = (
+            (b"\x24" * 10 + b"BIN002" + b"\x00\x90\x00\x90")
+            + (b"\x3a" * 10)
+            + (b"\x3a\x00\x90\x04\x3e\x01\xcd\x00\x50")
+            + (b"\x3a\x00\x00\x00\x00")
+        )
+        self.ml_file_3 = (
+            (b"\x24" * 10 + b"BIN003" + b"\x00\xa0\x00\xa0")
+            + (b"\x3a" * 10)
+            + (b"\x3a\x00\xa0\x04\x3e\x02\xcd\x00\x50")
+            + (b"\x3a\x00\x00\x00\x00")
+        )
+        self.three_ml_cmt = self.ml_file + self.ml_file_2 + self.ml_file_3
+
+        # 5. Null-padded CSAVE Program (short name, zero-padded instead of space-padded)
         self.null_padded_basic_file = (
             (b"\xd3" * 10 + b"DOOR\x00\x00")
             + struct.pack("<HH", 0x8010, 10)
@@ -1007,12 +985,7 @@ class TestPC88TapeTool(unittest.TestCase):
             + struct.pack("<H", 0x0000)
         )
 
-        # 5. Short (non-canonical) sync run immediately followed by bytes
-        # that coincidentally resemble a null-padded name. This must NOT be
-        # picked up as a header -- it's a regression test for a real
-        # false-positive found inside genuine binary payload data on a real
-        # tape dump (a 3-byte run of 0x24 followed by "DTTT\\x00\\x00" buried
-        # inside an unrelated machine-code file's data).
+        # 6. Short (non-canonical) sync run immediately followed by bytes that coincidentally resemble a null-padded name
         self.coincidental_short_run = (
             b"\x00" * 4 + b"\x24\x24\x24" + b"DTTT\x00\x00" + b"\x00" * 4
         )
@@ -1060,7 +1033,6 @@ class TestPC88TapeTool(unittest.TestCase):
         t88_1200 = T88File.from_cmt_data(self.ml_file, baud=1200)
         t88_300 = T88File.from_cmt_data(self.ml_file, baud=300)
 
-        # 1200 baud -> 44 ticks/byte; 300 baud -> 176 ticks/byte
         data_block_1200 = [b for b in t88_1200.blocks if b.tag == 0x0101][0]
         data_block_300 = [b for b in t88_300.blocks if b.tag == 0x0101][0]
 
@@ -1093,6 +1065,21 @@ class TestPC88TapeTool(unittest.TestCase):
         joined = CMTFile.join([item[2] for item in split_items])
         self.assertEqual(joined.data, self.combined_cmt)
 
+    def test_three_consecutive_mon_r_files(self) -> None:
+        """Tests that a tape with three consecutive MON R files splits completely without overshooting."""
+        cmt_file = CMTFile(self.three_ml_cmt)
+        split_items = cmt_file.split()
+
+        self.assertEqual(len(split_items), 3)
+        self.assertEqual(split_items[0][0], "BIN001")
+        self.assertEqual(split_items[0][2], self.ml_file)
+
+        self.assertEqual(split_items[1][0], "BIN002")
+        self.assertEqual(split_items[1][2], self.ml_file_2)
+
+        self.assertEqual(split_items[2][0], "BIN003")
+        self.assertEqual(split_items[2][2], self.ml_file_3)
+
     def test_null_padded_filename_after_canonical_sync(self) -> None:
         """Null-padded name IS recognized when preceded by a full sync run."""
         cmt_file = CMTFile(self.null_padded_basic_file)
@@ -1103,12 +1090,9 @@ class TestPC88TapeTool(unittest.TestCase):
         self.assertEqual(split_items[0][2], self.null_padded_basic_file)
 
     def test_no_false_positive_on_short_run_with_nulls(self) -> None:
-        """Null-padded-looking bytes after a short/non-canonical sync run
-        must NOT be treated as a real header (avoids false positives inside
-        ordinary binary payload data)."""
+        """Null-padded-looking bytes after a short/non-canonical sync run are not treated as header."""
         cmt_file = CMTFile(self.coincidental_short_run)
         split_items = cmt_file.split()
-        # Should be treated as one opaque raw blob, not split at "DTTT".
         self.assertEqual(len(split_items), 1)
         self.assertNotEqual(split_items[0][0], "DTTT")
 
@@ -1157,23 +1141,19 @@ class TestPC88TapeTool(unittest.TestCase):
             with open(t88_in, "wb") as f:
                 f.write(t88_orig.pack())
 
-            # Split without overriding baud -> should preserve individual baud rates & MARK tags
             split_info = split_t88_file(t88_in, split_dir, baud=None)
             self.assertEqual(len(split_info), 2)
             self.assertEqual(os.path.basename(split_info[0][3]), "01_BIN001.t88")
             self.assertEqual(os.path.basename(split_info[1][3]), "02_PROG01.t88")
 
-            # Check individual split files
             with open(split_info[0][3], "rb") as f:
                 t88_part1 = T88File.unpack(io.BytesIO(f.read()))
             with open(split_info[1][3], "rb") as f:
                 t88_part2 = T88File.unpack(io.BytesIO(f.read()))
 
-            # Verify carrier blocks were preserved in split T88 files
             self.assertTrue(any(b.tag == T88Tag.MARK for b in t88_part1.blocks))
             self.assertTrue(any(b.tag == T88Tag.MARK for b in t88_part2.blocks))
 
-            # Verify baud rate preservation (44 ticks/byte for part 1, 176 ticks/byte for part 2)
             dblock1 = [b for b in t88_part1.blocks if b.tag == 0x0101][0]
             dblock2 = [b for b in t88_part2.blocks if b.tag == 0x0101][0]
             _, ticks1, dlen1, _ = struct.unpack("<IIHH", dblock1.data[:12])
@@ -1181,7 +1161,6 @@ class TestPC88TapeTool(unittest.TestCase):
             self.assertEqual(ticks1, dlen1 * 44)
             self.assertEqual(ticks2, dlen2 * 176)
 
-            # Rejoin without baud override
             res_join = join_t88_files(
                 [split_info[0][3], split_info[1][3]], rejoined_out, baud=None
             )
@@ -1195,18 +1174,15 @@ class TestPC88TapeTool(unittest.TestCase):
     def test_join_t88_mixed_inputs_with_cmt_baud(self) -> None:
         """Tests that join-t88 preserves T88 timings while applying cmt_baud specifically to CMT inputs."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            # 1. Create a 300-baud T88 file
             t88_300 = T88File.from_cmt_data(self.basic_file, baud=300)
             p_t88 = os.path.join(tmpdir, "part1.t88")
             with open(p_t88, "wb") as f:
                 f.write(t88_300.pack())
 
-            # 2. Create a raw CMT file
             p_cmt = os.path.join(tmpdir, "part2.cmt")
             with open(p_cmt, "wb") as f:
                 f.write(self.ml_file)
 
-            # 3. Join with cmt_baud=600, baud=None
             p_joined = os.path.join(tmpdir, "joined_mixed.t88")
             join_t88_files([p_t88, p_cmt], p_joined, baud=None, cmt_baud=600)
 
@@ -1216,11 +1192,9 @@ class TestPC88TapeTool(unittest.TestCase):
             data_blocks = [b for b in joined_t88.blocks if b.tag == 0x0101]
             self.assertEqual(len(data_blocks), 2)
 
-            # Part 1 (from T88) should maintain 300 baud (176 ticks/byte)
             _, ticks1, dlen1, _ = struct.unpack("<IIHH", data_blocks[0].data[:12])
             self.assertEqual(ticks1, dlen1 * 176)
 
-            # Part 2 (from CMT) should use cmt_baud=600 (88 ticks/byte)
             _, ticks2, dlen2, _ = struct.unpack("<IIHH", data_blocks[1].data[:12])
             self.assertEqual(ticks2, dlen2 * 88)
 
@@ -1231,12 +1205,10 @@ class TestPC88TapeTool(unittest.TestCase):
             split_dir = os.path.join(tmpdir, "split_t88")
             rejoined_out = os.path.join(tmpdir, "rejoined.t88")
 
-            # Generate 1200 baud input
             t88_orig = T88File.from_cmt_data(self.combined_cmt, baud=1200)
             with open(t88_in, "wb") as f:
                 f.write(t88_orig.pack())
 
-            # Split with override to 300 baud
             split_info = split_t88_file(t88_in, split_dir, baud=300)
             for _, _, _, out_path in split_info:
                 with open(out_path, "rb") as f:
@@ -1245,7 +1217,6 @@ class TestPC88TapeTool(unittest.TestCase):
                 _, ticks, dlen, _ = struct.unpack("<IIHH", dblock.data[:12])
                 self.assertEqual(ticks, dlen * 176)
 
-            # Rejoin with override to 1200 baud
             split_files = [item[3] for item in split_info]
             res_join = join_t88_files(split_files, rejoined_out, baud=1200)
             with open(res_join, "rb") as f:
@@ -1254,6 +1225,18 @@ class TestPC88TapeTool(unittest.TestCase):
             for b in [b for b in rejoined.blocks if b.tag == 0x0101]:
                 _, ticks, dlen, _ = struct.unpack("<IIHH", b.data[:12])
                 self.assertEqual(ticks, dlen * 44)
+
+    def test_help_all_formatting(self) -> None:
+        """Tests that format_all_help produces valid combined help for all subcommands."""
+        parser = build_arg_parser()
+        all_help = format_all_help(parser)
+        self.assertIn("DETAILED SUBCOMMAND HELP", all_help)
+        self.assertIn("Subcommand: t2c", all_help)
+        self.assertIn("Subcommand: c2t", all_help)
+        self.assertIn("Subcommand: split-cmt", all_help)
+        self.assertIn("Subcommand: split-t88", all_help)
+        self.assertIn("Subcommand: join-cmt", all_help)
+        self.assertIn("Subcommand: join-t88", all_help)
 
     def test_cli_file_operations(self) -> None:
         """Tests disk file operations for convert, split, and join (both CMT and T88)."""
@@ -1269,7 +1252,6 @@ class TestPC88TapeTool(unittest.TestCase):
             with open(cmt_in, "wb") as f:
                 f.write(self.combined_cmt)
 
-            # c2t and t2c
             res_t88 = convert_cmt_to_t88(
                 cmt_in, t88_out, comment="CLI Temp Test", baud=1200
             )
@@ -1281,14 +1263,12 @@ class TestPC88TapeTool(unittest.TestCase):
             with open(res_cmt, "rb") as f:
                 self.assertEqual(f.read(), self.combined_cmt)
 
-            # split-cmt (verifying 2-digit index prefixing)
             split_info = split_cmt_file(cmt_in, split_dir)
             self.assertEqual(len(split_info), 3)
             self.assertEqual(os.path.basename(split_info[0][3]), "01_BIN001.cmt")
             self.assertEqual(os.path.basename(split_info[1][3]), "02_PROG01.cmt")
             self.assertEqual(os.path.basename(split_info[2][3]), "03_TEXT01.cmt")
 
-            # join-cmt
             split_files = [item[3] for item in split_info]
             res_join = join_cmt_files(split_files, joined_out)
             self.assertTrue(os.path.exists(res_join))
@@ -1296,14 +1276,12 @@ class TestPC88TapeTool(unittest.TestCase):
             with open(res_join, "rb") as f:
                 self.assertEqual(f.read(), self.combined_cmt)
 
-            # split-t88 (verifying 2-digit index prefixing & T88 generation)
             split_t88_info = split_t88_file(cmt_in, split_t88_dir, baud=1200)
             self.assertEqual(len(split_t88_info), 3)
             self.assertEqual(os.path.basename(split_t88_info[0][3]), "01_BIN001.t88")
             self.assertEqual(os.path.basename(split_t88_info[1][3]), "02_PROG01.t88")
             self.assertEqual(os.path.basename(split_t88_info[2][3]), "03_TEXT01.t88")
 
-            # join-t88
             split_t88_files = [item[3] for item in split_t88_info]
             res_t88_join = join_t88_files(split_t88_files, joined_t88_out, baud=1200)
             self.assertTrue(os.path.exists(res_t88_join))
@@ -1313,19 +1291,49 @@ class TestPC88TapeTool(unittest.TestCase):
                 self.assertEqual(unpacked_join.extract_cmt_payload(), self.combined_cmt)
 
 
+def format_all_help(parser: argparse.ArgumentParser) -> str:
+    """Formats full help output for the top-level parser and all subparsers."""
+    out = io.StringIO()
+    parser.print_help(out)
+    out.write("\n\n" + "=" * 80 + "\n")
+    out.write("DETAILED SUBCOMMAND HELP\n")
+    out.write("=" * 80 + "\n")
+
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            for choice, subparser in action.choices.items():
+                out.write(f"\n--- Subcommand: {choice} ---\n")
+                sub_out = io.StringIO()
+                subparser.print_help(sub_out)
+                out.write(sub_out.getvalue().strip() + "\n")
+    return out.getvalue()
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     """Builds the command-line argument parser."""
     parser = argparse.ArgumentParser(
         prog="pc88_tape_tools.py",
         description="NEC PC-8001 / PC-8801 Cassette Tape Format Utility (.t88 / .cmt)",
+        epilog="Tip: Run '%(prog)s <subcommand> --help' (e.g. 'pc88_tape_tools.py split-t88 --help') "
+        "or '%(prog)s --help-all' to view detailed options for all subcommands at once.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "--test",
         action="store_true",
         help="Run internal unit tests and exit",
     )
+    parser.add_argument(
+        "--help-all",
+        action="store_true",
+        help="Show full detailed help for all subcommands at once and exit",
+    )
 
-    subparsers = parser.add_subparsers(dest="command", help="Subcommand to execute")
+    subparsers = parser.add_subparsers(
+        dest="command",
+        title="Available Subcommands",
+        metavar="<command>",
+    )
 
     p_t2c = subparsers.add_parser(
         "t2c", help="Convert .t88 container to raw .cmt tape dump"
@@ -1446,6 +1454,10 @@ def main() -> None:
         result = runner.run(suite)
         sys.exit(0 if result.wasSuccessful() else 1)
 
+    if args.help_all:
+        print(format_all_help(parser))
+        sys.exit(0)
+
     if not args.command:
         parser.print_help()
         sys.exit(1)
@@ -1457,7 +1469,10 @@ def main() -> None:
 
         elif args.command == "c2t":
             out_file = convert_cmt_to_t88(
-                args.input, args.output, comment=args.comment, baud=args.baud
+                args.input,
+                args.output,
+                comment=args.comment,
+                baud=args.baud,
             )
             print(f"[SUCCESS] Converted {args.input} -> {out_file}")
 
