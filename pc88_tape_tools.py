@@ -11,6 +11,8 @@ Supported Protocols & Formats:
                 terminated strictly by 0-length record.
         * 0xD3: Tokenized BASIC (CSAVE) traversed line-by-line until 0x0000 pointer.
         * 0x9C: ASCII sequential files consumed until 0x1A EOF.
+        * 0x3A: Headerless Monitor Machine Code records (MON O / MON I), length-jumped
+                and terminated strictly by 0-length record.
     - .t88: Authentic Manuke Station / X88000 24-byte header container format
             with 12-byte DATA sub-headers and carrier lead-in/gap tags.
 
@@ -212,6 +214,7 @@ class CMTFile:
         0xD3: "BASIC Program (0xD3)",
         0x9C: "ASCII / Sequential File (0x9C)",
         0x24: "MON Machine Language Header (0x24)",
+        0x3A: "MON Machine Language Records (0x3A)",
     }
 
     # Canonical CSAVE/monitor sync-tone length.
@@ -275,6 +278,55 @@ class CMTFile:
     def extract_filename(cls, chunk: bytes) -> str:
         fname, _ = cls.extract_file_info(chunk)
         return fname
+
+    @classmethod
+    def _parse_mon_records_end(
+        cls, buf: bytes, start_p: int, limit_p: int
+    ) -> Optional[int]:
+        """Scans for structured MON records (0x3A) using state machine lookahead."""
+        first_colon = -1
+        for k in range(start_p, min(start_p + 32, limit_p)):
+            if buf[k] == 0x3A:
+                first_colon = k
+                break
+            elif buf[k] not in (0x00, 0xFF):
+                if k - start_p < 4:
+                    continue
+                return None
+
+        if first_colon == -1:
+            return None
+
+        k = first_colon
+        while k < limit_p:
+            colon_pos = buf.find(b"\x3a", k, limit_p)
+            if colon_pos == -1:
+                return None
+
+            while colon_pos + 1 < limit_p and buf[colon_pos + 1] == 0x3A:
+                colon_pos += 1
+
+            # 1. Standard 5-byte terminator (: [addr:2] 00 [chk])
+            if colon_pos + 4 <= limit_p and buf[colon_pos + 3] == 0x00:
+                end_p = colon_pos + 5
+                if end_p == limit_p or (
+                    end_p < limit_p
+                    and buf[end_p] in (0x3A, 0x24, 0xD3, 0x9C, 0x00, 0xFF)
+                ):
+                    return end_p
+
+            # 2. Short 3-byte terminator (: 00 [chk]) where next byte is boundary
+            if colon_pos + 2 <= limit_p and buf[colon_pos + 1] == 0x00:
+                end_p = colon_pos + 3
+                if end_p == limit_p or (
+                    end_p < limit_p
+                    and buf[end_p] in (0x3A, 0x24, 0xD3, 0x9C, 0x00, 0xFF)
+                ):
+                    return end_p
+
+            k = colon_pos + 1
+
+        return None
 
     def split(self) -> List[Tuple[str, str, bytes]]:
         """Splits multi-file CMT or T88 stream using the authentic ROM state machine."""
@@ -390,6 +442,25 @@ class CMTFile:
                         break
                 i += 1
 
+            # Check if a headerless MON machine code record stream exists before next preamble
+            limit_p = preamble_pos if preamble_pos != -1 else n
+            if pos < limit_p:
+                mon_end = self._parse_mon_records_end(buf, pos, limit_p)
+                if mon_end is not None and mon_end <= limit_p:
+                    chunk_data = buf[pos:mon_end]
+                    uname = self._dedup_name("part", used_names)
+                    entries.append(
+                        (
+                            uname,
+                            self.TYPE_NAMES.get(
+                                0x3A, "MON Machine Language Records (0x3A)"
+                            ),
+                            chunk_data,
+                        )
+                    )
+                    pos = mon_end
+                    continue
+
             if preamble_pos == -1:
                 # No more headers in stream; append remainder to the last file
                 if pos < n:
@@ -414,39 +485,8 @@ class CMTFile:
             # STATE: PARSE_BODY (Protocol-driven consumption, zero heuristics)
             # 1. Machine Code File (0x24) - MON R length-jumped record consumption
             if preamble_byte == 0x24:
-                rec_p = body_start
-                file_end = n
-                while rec_p < n:
-                    colon_pos = buf.find(b"\x3a", rec_p)
-                    if colon_pos == -1:
-                        file_end = n
-                        break
-
-                    while colon_pos + 1 < n and buf[colon_pos + 1] == 0x3A:
-                        colon_pos += 1
-
-                    # Check for 3-byte short zero-length terminator (: 00 [chk])
-                    if (
-                        colon_pos + 2 <= n
-                        and buf[colon_pos : colon_pos + 2] == b"\x3a\x00"
-                    ):
-                        file_end = colon_pos + 3
-                        break
-
-                    # Check for 5-byte standard zero-length terminator (: [addr:2] 00 [chk])
-                    if colon_pos + 4 <= n and buf[colon_pos + 3] == 0x00:
-                        file_end = colon_pos + 5
-                        break
-
-                    # Active record: : [addr:2] [len:1] [data:len] [chk:1]
-                    if colon_pos + 4 <= n:
-                        rlen = buf[colon_pos + 3]
-                        if 0 < rlen <= 255:
-                            rec_p = colon_pos + 1 + 2 + 1 + rlen + 1
-                            continue
-
-                    rec_p = colon_pos + 1
-
+                rec_end = self._parse_mon_records_end(buf, body_start, n)
+                file_end = rec_end if rec_end is not None else n
                 chunk_data = buf[file_start:file_end]
                 uname = self._dedup_name(fname, used_names)
                 entries.append((uname, type_str, chunk_data))
@@ -500,7 +540,12 @@ class CMTFile:
 
             # 3. ASCII / Sequential Text File (0x9C) - Ctrl-Z (0x1A) consumption
             elif preamble_byte == 0x9C:
-                eof_p = buf.find(b"\x1a", body_start)
+                file_end = n
+                curr_p = body_start
+                if curr_p + 3 <= n and buf[curr_p : curr_p + 3] == b"\x9c" * 3:
+                    while curr_p < n and buf[curr_p] == 0x9C:
+                        curr_p += 1
+                eof_p = buf.find(b"\x1a", curr_p)
                 file_end = eof_p + 1 if eof_p != -1 else n
                 chunk_data = buf[file_start:file_end]
                 uname = self._dedup_name(fname, used_names)
@@ -963,14 +1008,12 @@ class TestPC88TapeTool(unittest.TestCase):
 
         # 4. Multi-ML tape: Three consecutive MON R files
         self.ml_file_2 = (
-            (b"\x24" * 10 + b"BIN002" + b"\x00\x90\x00\x90")
-            + (b"\x3a" * 10)
+            (b"\x24\x24\x24" + b"BIN002" + b"\x00\x90\x00\x90")
             + (b"\x3a\x00\x90\x04\x3e\x01\xcd\x00\x50")
             + (b"\x3a\x00\x00\x00\x00")
         )
         self.ml_file_3 = (
-            (b"\x24" * 10 + b"BIN003" + b"\x00\xa0\x00\xa0")
-            + (b"\x3a" * 10)
+            (b"\x24\x24\x24" + b"BIN003" + b"\x00\xa0\x00\xa0")
             + (b"\x3a\x00\xa0\x04\x3e\x02\xcd\x00\x50")
             + (b"\x3a\x00\x00\x00\x00")
         )
@@ -988,6 +1031,20 @@ class TestPC88TapeTool(unittest.TestCase):
         # 6. Short (non-canonical) sync run immediately followed by bytes that coincidentally resemble a null-padded name
         self.coincidental_short_run = (
             b"\x00" * 4 + b"\x24\x24\x24" + b"DTTT\x00\x00" + b"\x00" * 4
+        )
+
+        # 7. Tokenized BASIC followed by two headerless MON O files with 0x3A records
+        self.basic_no_inter_sync = (
+            (b"\xd3" * 10 + b"PROG01")
+            + struct.pack("<HH", 0x8010, 10)
+            + b'\x90 "HELLO WORLD"'
+            + b"\x00"
+            + struct.pack("<H", 0x0000)
+        )
+        self.mon_o_1 = b"\x3a\x00\x80\x04\x01\x02\x03\x04\x00" + b"\x3a\x00\x00"
+        self.mon_o_2 = b"\x3a\x00\x90\x06\x11\x12\x13\x14\x15\x16\x00" + b"\x3a\x00\x00"
+        self.basic_and_two_mon_o_tape = (
+            self.basic_no_inter_sync + self.mon_o_1 + self.mon_o_2
         )
 
     def test_t88_block_pack_unpack(self) -> None:
@@ -1079,6 +1136,24 @@ class TestPC88TapeTool(unittest.TestCase):
 
         self.assertEqual(split_items[2][0], "BIN003")
         self.assertEqual(split_items[2][2], self.ml_file_3)
+
+    def test_basic_and_headerless_mon_o_files_split(self) -> None:
+        """Tests splitting tape with tokenized BASIC and two headerless MON O files into three files."""
+        cmt_file = CMTFile(self.basic_and_two_mon_o_tape)
+        split_items = cmt_file.split()
+
+        self.assertEqual(len(split_items), 3)
+        self.assertEqual(split_items[0][0], "PROG01")
+        self.assertEqual(split_items[0][1], "BASIC Program (0xD3)")
+        self.assertEqual(split_items[0][2], self.basic_no_inter_sync)
+
+        self.assertEqual(split_items[1][0], "part")
+        self.assertEqual(split_items[1][1], "MON Machine Language Records (0x3A)")
+        self.assertEqual(split_items[1][2], self.mon_o_1)
+
+        self.assertEqual(split_items[2][0], "part_2")
+        self.assertEqual(split_items[2][1], "MON Machine Language Records (0x3A)")
+        self.assertEqual(split_items[2][2], self.mon_o_2)
 
     def test_null_padded_filename_after_canonical_sync(self) -> None:
         """Null-padded name IS recognized when preceded by a full sync run."""
