@@ -48,13 +48,13 @@ conversion between physical container images (.t88) and raw sequential tape dump
           linked line table traversed line-by-line until 0x0000 next-pointer.
   - 0x24: MON Machine Language Header (MON W / MON R).
           Preamble (3-10x 0x24) + 6-byte filename + 4-byte Start Address Record
-          (: [addr_hi:1] [addr_lo:1] [chk:1]) + length-jumped data records
-          (: [len:1] [data:len] [chk:1]) + 0-length terminator (`: \x00` [chk:1]).
+          (`:` [addr_hi:1] [addr_lo:1] [chk:1]) + length-jumped data records
+          (`:` [len:1] [data:len] [chk:1]) + 0-length terminator (`:` `\x00` [chk:1]).
   - 0x9C: ASCII Sequential File (SAVE / PRINT#).
           Preamble (3-10x 0x9C) + 6-byte filename + text stream terminated by 0x1A (EOF).
   - 0x3A: Headerless Monitor Machine Language Records (MON O / MON I).
           Direct 4-byte Start Address Record + length-jumped data records,
-          terminated strictly by 0-length record (`: \x00`).
+          terminated strictly by 0-length record (`:` `\x00`).
   - 0xFF: Custom Machine Language Loaders (e.g. NONTAMA format).
           Header preamble (`\xffNONTAMA`) + 6-byte descriptor (load_addr, len, exec_addr) +
           direct length-jumped payload.
