@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NEC PC-8001 / PC-8801 Cassette Tape Format Utility (`pc88_tape_tools.py`).
+r"""NEC PC-8001 / PC-8801 Cassette Tape Format Utility (`pc88_tape_tools.py`).
 
 Provides state-machine parsing, splitting, joining, diagnostic analysis, and bidirectional
 conversion between physical container images (.t88) and raw sequential tape dumps (.cmt).
@@ -19,8 +19,8 @@ FORMAT ARCHITECTURE & RELATIONSHIP:
                                          ▼
 +-----------------------------------------------------------------------------------+
 | .cmt Sequential Stream (Logical Demodulated Stream Layer)                         |
-|   * Continuous sequential byte stream directly consumed by BIOS/Monitor ROM.     |
-|   * File boundaries are defined by Protocol Headers or Address Record Syncs:     |
+|   * Continuous sequential byte stream directly consumed by BIOS/Monitor ROM.      |
+|   * File boundaries are defined by Protocol Headers or Address Record Syncs:      |
 |     - 0xD3: CSAVE Tokenized BASIC Program (Line-linked table -> 0x0000 pointer)   |
 |     - 0x24: MON Machine Language Header + 0x3A records (terminated by :00)        |
 |     - 0x9C: ASCII Text / Sequential Data (consumed until 0x1A EOF)                |
