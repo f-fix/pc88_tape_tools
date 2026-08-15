@@ -1,22 +1,65 @@
 #!/usr/bin/env python3
 """NEC PC-8001 / PC-8801 Cassette Tape Format Utility (`pc88_tape_tools.py`).
 
-Provides parsing, splitting, joining, and bidirectional conversion between the
-multi-file container format (.t88) and raw sequential tape dumps (.cmt).
+Provides state-machine parsing, splitting, joining, diagnostic analysis, and bidirectional
+conversion between physical container images (.t88) and raw sequential tape dumps (.cmt).
 
-Supported Protocols & Formats:
-    - N-BASIC (PC-8001), N80-BASIC (PC-8001mkII), N88-BASIC V1/V2 (PC-8801 series)
-    - .cmt: Sequential tape stream using exact BIOS / Monitor ROM state machine:
-        * 0x24: Monitor Machine Code header + structured 0x3A records (length-jumped),
-                terminated strictly by 0-length record.
-        * 0xD3: Tokenized BASIC (CSAVE) traversed line-by-line until 0x0000 pointer.
-        * 0x9C: ASCII sequential files consumed until 0x1A EOF.
-        * 0x3A: Headerless Monitor Machine Code records (MON O / MON I), length-jumped
-                and terminated strictly by 0-length record.
-    - .t88: Authentic Manuke Station / X88000 24-byte header container format
-            with 12-byte DATA sub-headers and carrier lead-in/gap tags.
+===================================================================================
+FORMAT ARCHITECTURE & RELATIONSHIP:
+===================================================================================
 
-Developed using LLM coding assistance.
++-----------------------------------------------------------------------------------+
+| .t88 Container (Physical Carrier / Container Layer)                               |
+|   [24-Byte Header] -> [Blocks: VERSION, COMMENT, MARK, SPACE, GAP, DATA_1200/300] |
+|   * Carrier lead-ins (MARK/GAP/SPACE) define block intervals and tape carrier.    |
+|   * 12-byte DATA sub-header embeds start tick, tick length, and baud duration.    |
++-----------------------------------------------------------------------------------+
+                                         │
+                   extract_cmt_payload() │ from_cmt_data()
+                                         ▼
++-----------------------------------------------------------------------------------+
+| .cmt Sequential Stream (Logical Demodulated Stream Layer)                         |
+|   * Continuous sequential byte stream directly consumed by BIOS/Monitor ROM.     |
+|   * File boundaries are defined by Protocol Headers or Address Record Syncs:     |
+|     - 0xD3: CSAVE Tokenized BASIC Program (Line-linked table -> 0x0000 pointer)   |
+|     - 0x24: MON Machine Language Header + 0x3A records (terminated by :00)        |
+|     - 0x9C: ASCII Text / Sequential Data (consumed until 0x1A EOF)                |
+|     - 0x3A: Headerless MON O / MON I Stream (: [addr:2] [chk] -> : [len] -> :00)  |
+|     - 0xFF: Custom Machine Language Loaders (e.g. NONTAMA: len + load/exec addr)  |
++-----------------------------------------------------------------------------------+
+
+===================================================================================
+SUPPORTED PROTOCOLS & STATE MACHINES:
+===================================================================================
+    - .t88 (Physical Signal / Container Layer):
+        An emulation container capturing the physical cassette signal structure.
+        Consists of a 24-byte ASCII header followed by tagged timing and data blocks:
+          * 0x0103 (MARK): Lead-in carrier tone burst (~2400 Hz high frequency).
+          * 0x0102 (SPACE): Space carrier tone (~1200 Hz low frequency).
+          * 0x0100 (GAP): Silence / unrecorded tape interval.
+          * 0x0101 (DATA): Timing sub-header (12 bytes: start_tick, tick_len, data_len)
+                           plus raw demodulated byte payload.
+          * 0x0010 (COMMENT): UTF-8/ASCII metadata annotations.
+          * 0x0000 (END): Terminal container marker.
+
+    - .cmt (Logical Sequential Tape Stream):
+        The continuous demodulated byte stream presented to the CPU/BIOS I/O state machine.
+        Contains no container framing; boundaries are determined purely by protocol state:
+          * 0xD3: CSAVE Tokenized BASIC Program.
+                  Preamble (3-10x 0xD3) + 6-byte filename + inter-block sync tone +
+                  linked line table traversed line-by-line until 0x0000 next-pointer.
+          * 0x24: MON Machine Language Header (MON W / MON R).
+                  Preamble (3-10x 0x24) + 6-byte filename + 4-byte Start Address Record
+                  (: [addr_hi:1] [addr_lo:1] [chk:1]) + length-jumped data records
+                  (: [len:1] [data:len] [chk:1]) + 0-length terminator (: \x00 [chk:1]).
+          * 0x9C: ASCII Sequential File (SAVE / PRINT#).
+                  Preamble (3-10x 0x9C) + 6-byte filename + text stream terminated by 0x1A (EOF).
+          * 0x3A: Headerless Monitor Machine Language Records (MON O / MON I).
+                  Direct 4-byte Start Address Record + length-jumped data records,
+                  terminated strictly by 0-length record (: \x00).
+          * 0xFF: Custom Machine Language Loaders (e.g. NONTAMA format).
+                  Header preamble (\xffNONTAMA) + 6-byte descriptor (load_addr, len, exec_addr) +
+                  direct length-jumped payload.
 """
 
 import argparse
@@ -180,7 +223,11 @@ class T88File:
 
     @classmethod
     def from_cmt_data(
-        cls, cmt_data: bytes, comment: str = "", chunk_size: int = 512, baud: int = 1200
+        cls,
+        cmt_data: bytes,
+        comment: str = "",
+        chunk_size: int = 32000,
+        baud: int = 1200,
     ) -> "T88File":
         blocks: List[T88Block] = []
         blocks.append(T88Block(T88Tag.VERSION, struct.pack("<H", 0x0100)))
@@ -195,10 +242,19 @@ class T88File:
         current_tick += mark_len
 
         ticks_per_byte = int(round(44 * 1200 / baud)) if baud > 0 else 44
-        data_len = len(cmt_data)
-        data_ticks = data_len * ticks_per_byte
-        data_header = struct.pack("<IIHH", current_tick, data_ticks, data_len, 0x0000)
-        blocks.append(T88Block(0x0101, data_header + cmt_data))
+        if not cmt_data:
+            data_header = struct.pack("<IIHH", current_tick, 0, 0, 0x0000)
+            blocks.append(T88Block(0x0101, data_header))
+        else:
+            for offset in range(0, len(cmt_data), chunk_size):
+                chunk = cmt_data[offset : offset + chunk_size]
+                data_len = len(chunk)
+                data_ticks = data_len * ticks_per_byte
+                data_header = struct.pack(
+                    "<IIHH", current_tick, data_ticks, data_len, 0x0000
+                )
+                blocks.append(T88Block(0x0101, data_header + chunk))
+                current_tick += data_ticks
 
         blocks.append(T88Block(T88Tag.END, b""))
         return cls(magic=cls.DEFAULT_MAGIC, version=0x0100, blocks=blocks)
@@ -215,19 +271,26 @@ class CMTFile:
         0x9C: "ASCII / Sequential File (0x9C)",
         0x24: "MON Machine Language Header (0x24)",
         0x3A: "MON Machine Language Records (0x3A)",
+        0xFF: "NONTAMA Machine Language Loader",
     }
 
-    # Canonical CSAVE/monitor sync-tone length.
     CANONICAL_SYNC_LEN: int = 8
 
     def __init__(self, data: bytes = b"") -> None:
         self.data: bytes = data
 
+    @staticmethod
+    def _dedup_name(name: str, used: Dict[str, int]) -> str:
+        if name in used:
+            used[name] += 1
+            return f"{name}_{used[name]}"
+        used[name] = 1
+        return name
+
     @classmethod
     def is_valid_cassette_filename(
         cls, name_bytes: bytes, allow_null: bool = False
     ) -> bool:
-        """Verifies if a 6-byte sequence forms a valid space-padded PC-8001/PC-8801 cassette filename."""
         if len(name_bytes) != 6:
             return False
         ok_byte = (
@@ -244,9 +307,21 @@ class CMTFile:
 
     @classmethod
     def extract_file_info(cls, chunk: bytes) -> Tuple[str, str]:
-        """Extracts filename and file format description from a cassette header block."""
-        if len(chunk) < 9:
+        if len(chunk) < 7:
             return "", "Raw Data / Unknown"
+
+        idx_non = chunk.find(b"NONTAMA")
+        if idx_non != -1:
+            is_nontama = False
+            if idx_non == 0 and len(chunk) >= 13:
+                is_nontama = True
+            elif idx_non > 0 and chunk[idx_non - 1] == 0xFF:
+                if all(b == 0 for b in chunk[: idx_non - 1]):
+                    is_nontama = True
+            if is_nontama:
+                return "NONTAMA", cls.TYPE_NAMES.get(
+                    0xFF, "NONTAMA Machine Language Loader"
+                )
 
         for p_byte in (0x24, 0xD3, 0x9C):
             for min_len in (10, 8, 6, 4, 3):
@@ -272,6 +347,9 @@ class CMTFile:
                                 )
                                 return name_str, file_type
 
+        if chunk.startswith(b":") and len(chunk) >= 4:
+            return "", cls.TYPE_NAMES.get(0x3A, "MON Machine Language Records (0x3A)")
+
         return "", "Raw Data / Unknown"
 
     @classmethod
@@ -279,137 +357,128 @@ class CMTFile:
         fname, _ = cls.extract_file_info(chunk)
         return fname
 
-    @classmethod
-    def _parse_mon_records_end(
-        cls, buf: bytes, start_p: int, limit_p: int
-    ) -> Optional[int]:
-        """Scans for structured MON records (0x3A) using state machine lookahead."""
-        first_colon = -1
-        for k in range(start_p, min(start_p + 32, limit_p)):
-            if buf[k] == 0x3A:
-                first_colon = k
-                break
-            elif buf[k] not in (0x00, 0xFF):
-                if k - start_p < 4:
-                    continue
-                return None
-
-        if first_colon == -1:
-            return None
-
-        k = first_colon
-        while k < limit_p:
-            colon_pos = buf.find(b"\x3a", k, limit_p)
-            if colon_pos == -1:
-                return None
-
-            while colon_pos + 1 < limit_p and buf[colon_pos + 1] == 0x3A:
-                colon_pos += 1
-
-            # 1. Standard 5-byte terminator (: [addr:2] 00 [chk])
-            if colon_pos + 4 <= limit_p and buf[colon_pos + 3] == 0x00:
-                end_p = colon_pos + 5
-                if end_p == limit_p or (
-                    end_p < limit_p
-                    and buf[end_p] in (0x3A, 0x24, 0xD3, 0x9C, 0x00, 0xFF)
-                ):
-                    return end_p
-
-            # 2. Short 3-byte terminator (: 00 [chk]) where next byte is boundary
-            if colon_pos + 2 <= limit_p and buf[colon_pos + 1] == 0x00:
-                end_p = colon_pos + 3
-                if end_p == limit_p or (
-                    end_p < limit_p
-                    and buf[end_p] in (0x3A, 0x24, 0xD3, 0x9C, 0x00, 0xFF)
-                ):
-                    return end_p
-
-            k = colon_pos + 1
-
-        return None
-
     def split(self) -> List[Tuple[str, str, bytes]]:
         """Splits multi-file CMT or T88 stream using the authentic ROM state machine."""
         if not self.data:
             return []
 
-        # T88 Container handling: group discrete T88 DATA blocks by header lead-in
-        if len(self.data) >= 24 and T88File.is_valid_magic(self.data[:24]):
-            try:
-                t88 = T88File.unpack(io.BytesIO(self.data))
-                data_payloads: List[bytes] = []
-                for block in t88.blocks:
-                    if block.tag == 0x0101 and len(block.data) >= 12:
-                        _, _, dlen, _ = struct.unpack("<IIHH", block.data[:12])
-                        payload = block.data[12 : 12 + dlen]
-                        if payload:
-                            data_payloads.append(payload)
-
-                if data_payloads:
-                    results: List[Tuple[str, str, bytes]] = []
-                    used_names: Dict[str, int] = {}
-                    curr_name = ""
-                    curr_type = ""
-                    curr_chunks: List[bytes] = []
-
-                    for payload in data_payloads:
-                        fname, ftype = self.extract_file_info(payload)
-                        if fname:
-                            if curr_chunks:
-                                uname = curr_name or "part"
-                                uname = self._dedup_name(uname, used_names)
-                                results.append(
-                                    (
-                                        uname,
-                                        curr_type or "Binary Data",
-                                        b"".join(curr_chunks),
-                                    )
-                                )
-                                curr_chunks = []
-                            curr_name = fname
-                            curr_type = ftype
-                            curr_chunks.append(payload)
-                        else:
-                            curr_chunks.append(payload)
-
-                    if curr_chunks:
-                        uname = curr_name or "part"
-                        uname = self._dedup_name(uname, used_names)
-                        results.append(
-                            (uname, curr_type or "Binary Data", b"".join(curr_chunks))
-                        )
-
-                    # If multiple files were identified from T88 blocks, return them directly
-                    if len(results) > 1 or (
-                        results and not self.extract_file_info(data_payloads[0])[0]
-                    ):
-                        return results
-            except Exception:
-                pass
-
-        # Raw CMT Stream state machine:
-        buf = self.data
-        if len(buf) >= 24 and T88File.is_valid_magic(buf[:24]):
-            try:
-                t88_obj = T88File.unpack(io.BytesIO(buf))
-                buf = t88_obj.extract_cmt_payload()
-            except Exception:
-                pass
-
+        buf = _extract_payload_or_raw(self.data)
         n = len(buf)
         pos = 0
-        entries: List[Tuple[str, str, bytes]] = []
         used_names: Dict[str, int] = {}
+        entries: List[Tuple[str, str, bytes]] = []
 
         while pos < n:
-            # STATE: HUNT_HEADER
-            preamble_pos = -1
-            preamble_byte = 0
-            fname = ""
-            body_start = -1
+            file_start = pos
+
+            # 1. Custom Bootstrap Loader (0xFF NONTAMA)
+            is_nontama = False
+            nt_p = pos
+            while nt_p < min(pos + 256, n - 7):
+                if buf[nt_p : nt_p + 8] == b"\xffNONTAMA" or (
+                    nt_p == 0 and buf[0:7] == b"NONTAMA"
+                ):
+                    is_nontama = True
+                    break
+                elif buf[nt_p] not in (0x00, 0xFF):
+                    break
+                nt_p += 1
+
+            if is_nontama:
+                p = nt_p + (8 if buf[nt_p : nt_p + 8] == b"\xffNONTAMA" else 7)
+                if p + 6 <= n:
+                    _, dlen, _ = struct.unpack("<HHH", buf[p : p + 6])
+                    p += 6
+                    file_end = min(p + dlen + 1, n)
+                    while file_end < n and buf[file_end] in (0x00, 0xFF):
+                        if file_end + 1 < n and (
+                            buf[file_end + 1] in (0x24, 0xD3, 0x9C, 0x3A)
+                            or buf[file_end + 1 : file_end + 9] == b"\xffNONTAMA"
+                        ):
+                            break
+                        file_end += 1
+                else:
+                    file_end = n
+                chunk = buf[file_start:file_end]
+                entries.append(
+                    (
+                        self._dedup_name("NONTAMA", used_names),
+                        "NONTAMA Machine Language Loader",
+                        chunk,
+                    )
+                )
+                pos = file_end
+                continue
+
+            # 2. Headerless MON Record Stream (MON O / MON I)
+            is_mon_o = False
+            mp = pos
+            while mp < min(pos + 48, n - 4):
+                if buf[mp] == 0x3A:
+                    ah, al, chk = buf[mp + 1], buf[mp + 2], buf[mp + 3]
+                    if (ah + al + chk) & 0xFF == 0 and ah != 0:
+                        is_mon_o = True
+                        break
+                    else:
+                        break
+                elif buf[mp] not in (0x00, 0xFF):
+                    break
+                mp += 1
+
+            if is_mon_o:
+                p = mp + 4
+                term_end = n
+                while p < n:
+                    while p < n and buf[p] != 0x3A:
+                        p += 1
+                    if p >= n:
+                        break
+                    while p + 1 < n and buf[p] == 0x3A and buf[p + 1] == 0x3A:
+                        p += 1
+                    if p + 2 <= n:
+                        dlen = buf[p + 1]
+                        if dlen == 0:
+                            term_end = p + 3 if p + 3 <= n else p + 2
+                            while term_end < n and buf[term_end] in (0x00, 0xFF):
+                                if term_end + 1 < n and (
+                                    buf[term_end + 1] in (0x24, 0xD3, 0x9C, 0x3A)
+                                    or buf[term_end + 1 : term_end + 9]
+                                    == b"\xffNONTAMA"
+                                ):
+                                    break
+                                term_end += 1
+                            break
+                        elif p + 2 + dlen + 1 <= n:
+                            p = p + 2 + dlen + 1
+                            continue
+                    p += 1
+                file_end = term_end
+                chunk = buf[file_start:file_end]
+                entries.append(
+                    (
+                        self._dedup_name("part", used_names),
+                        "MON Machine Language Records (0x3A)",
+                        chunk,
+                    )
+                )
+                pos = file_end
+                continue
+
+            # 3. Named Protocol Header: 0x24, 0xD3, 0x9C
+            hdr_pos = -1
+            hdr_name = ""
+            hdr_type = ""
+            hdr_body = -1
 
             i = pos
-            while i < n - 8:
+            while i < n - 7:
+                if buf[i : i + 8] == b"\xffNONTAMA":
+                    hdr_pos = i
+                    hdr_name = "NONTAMA"
+                    hdr_type = "NONTAMA Machine Language Loader"
+                    hdr_body = i + 14
+                    break
+
                 b = buf[i]
                 if b in (0x24, 0xD3, 0x9C):
                     for plen in (10, 8, 6, 4, 3):
@@ -420,8 +489,15 @@ class CMTFile:
                             if idx + 6 <= n:
                                 name_bytes = buf[idx : idx + 6]
                                 allow_null = (idx - i) >= self.CANONICAL_SYNC_LEN
-                                if self.is_valid_cassette_filename(
-                                    name_bytes, allow_null=allow_null
+                                ok_byte = (
+                                    lambda c: (32 <= c <= 126)
+                                    or (0xA1 <= c <= 0xDF)
+                                    or (allow_null and c == 0)
+                                )
+                                if sum(
+                                    1 for c in name_bytes if ok_byte(c)
+                                ) == 6 and any(
+                                    c not in (0x20, 0x00) for c in name_bytes
                                 ):
                                     name_str = "".join(
                                         (
@@ -433,134 +509,173 @@ class CMTFile:
                                     ).strip()
                                     name_str = re.sub(r'[\\/*?:"<>|]', "_", name_str)
                                     if name_str:
-                                        fname = name_str
-                                        preamble_pos = i
-                                        preamble_byte = b
-                                        body_start = idx + 6
+                                        hdr_pos = i
+                                        hdr_name = name_str
+                                        type_map = {
+                                            0xD3: "BASIC Program (0xD3)",
+                                            0x24: "MON Machine Language Header (0x24)",
+                                            0x9C: "ASCII / Sequential File (0x9C)",
+                                        }
+                                        hdr_type = type_map.get(
+                                            b, f"Unknown (0x{b:02X})"
+                                        )
+                                        hdr_body = idx + 6
                                         break
-                    if preamble_pos != -1:
+                    if hdr_pos != -1:
                         break
                 i += 1
 
-            # Check if a headerless MON machine code record stream exists before next preamble
-            limit_p = preamble_pos if preamble_pos != -1 else n
-            if pos < limit_p:
-                mon_end = self._parse_mon_records_end(buf, pos, limit_p)
-                if mon_end is not None and mon_end <= limit_p:
-                    chunk_data = buf[pos:mon_end]
-                    uname = self._dedup_name("part", used_names)
-                    entries.append(
-                        (
-                            uname,
-                            self.TYPE_NAMES.get(
-                                0x3A, "MON Machine Language Records (0x3A)"
-                            ),
-                            chunk_data,
-                        )
-                    )
-                    pos = mon_end
-                    continue
-
-            if preamble_pos == -1:
-                # No more headers in stream; append remainder to the last file
+            if hdr_pos == -1:
                 if pos < n:
                     if entries:
                         p_name, p_type, p_data = entries[-1]
-                        entries[-1] = (p_name, p_type, p_data + buf[pos:])
+                        entries[-1] = (p_name, p_type, p_data + buf[pos:n])
                     else:
-                        entries.append(("part_001", "Raw Data / Unknown", buf[pos:]))
+                        entries.append(
+                            (
+                                self._dedup_name("part", used_names),
+                                "Raw Data / Unknown",
+                                buf[pos:n],
+                            )
+                        )
                 break
 
-            # If there were bytes before this header, attach to previous entry without loss
-            if preamble_pos > pos:
+            if hdr_pos > pos:
                 if entries:
                     p_name, p_type, p_data = entries[-1]
-                    entries[-1] = (p_name, p_type, p_data + buf[pos:preamble_pos])
+                    entries[-1] = (p_name, p_type, p_data + buf[pos:hdr_pos])
+                file_start = hdr_pos
 
-            file_start = preamble_pos
-            type_str = self.TYPE_NAMES.get(
-                preamble_byte, f"Unknown (0x{preamble_byte:02X})"
-            )
-
-            # STATE: PARSE_BODY (Protocol-driven consumption, zero heuristics)
-            # 1. Machine Code File (0x24) - MON R length-jumped record consumption
-            if preamble_byte == 0x24:
-                rec_end = self._parse_mon_records_end(buf, body_start, n)
-                file_end = rec_end if rec_end is not None else n
-                chunk_data = buf[file_start:file_end]
-                uname = self._dedup_name(fname, used_names)
-                entries.append((uname, type_str, chunk_data))
+            if hdr_type == "MON Machine Language Header (0x24)":
+                p = hdr_body
+                while p < n and buf[p] != 0x3A:
+                    p += 1
+                if p + 4 <= n and buf[p] == 0x3A:
+                    p += 4
+                term_end = n
+                while p < n:
+                    while p < n and buf[p] != 0x3A:
+                        p += 1
+                    if p >= n:
+                        break
+                    while p + 1 < n and buf[p] == 0x3A and buf[p + 1] == 0x3A:
+                        p += 1
+                    if p + 2 <= n:
+                        dlen = buf[p + 1]
+                        if dlen == 0:
+                            term_end = p + 3 if p + 3 <= n else p + 2
+                            while term_end < n and buf[term_end] in (0x00, 0xFF):
+                                if term_end + 1 < n and (
+                                    buf[term_end + 1] in (0x24, 0xD3, 0x9C, 0x3A)
+                                    or buf[term_end + 1 : term_end + 9]
+                                    == b"\xffNONTAMA"
+                                ):
+                                    break
+                                term_end += 1
+                            break
+                        elif p + 2 + dlen + 1 <= n:
+                            p = p + 2 + dlen + 1
+                            continue
+                    p += 1
+                file_end = term_end
+                chunk = buf[file_start:file_end]
+                entries.append(
+                    (self._dedup_name(hdr_name, used_names), hdr_type, chunk)
+                )
                 pos = file_end
+                continue
 
-            # 2. Tokenized BASIC Program (0xD3) - Line-by-line pointer traversal
-            elif preamble_byte == 0xD3:
-                file_end = n
-                curr_p = body_start
-
-                if curr_p + 3 <= n and buf[curr_p : curr_p + 3] == b"\xd3" * 3:
-                    while curr_p < n and buf[curr_p] == 0xD3:
-                        curr_p += 1
-
-                line_count = 0
-                while curr_p + 2 <= n:
-                    next_ptr = buf[curr_p] | (buf[curr_p + 1] << 8)
-                    if next_ptr == 0x0000:
-                        file_end = curr_p + 2
-                        break
-                    if curr_p + 4 > n:
-                        break
-                    line_zero = buf.find(b"\x00", curr_p + 4)
-                    if line_zero == -1:
-                        break
-                    curr_p = line_zero + 1
-                    line_count += 1
-
-                if file_end == n and line_count == 0:
-                    data_p = buf.find(b"\xd3" * 3, body_start)
-                    if data_p != -1:
-                        curr_p = data_p + 3
-                        while curr_p < n and buf[curr_p] == 0xD3:
-                            curr_p += 1
-                        while curr_p + 2 <= n:
-                            next_ptr = buf[curr_p] | (buf[curr_p + 1] << 8)
-                            if next_ptr == 0x0000:
-                                file_end = curr_p + 2
-                                break
-                            if curr_p + 4 > n:
-                                break
-                            line_zero = buf.find(b"\x00", curr_p + 4)
-                            if line_zero == -1:
-                                break
-                            curr_p = line_zero + 1
-
-                chunk_data = buf[file_start:file_end]
-                uname = self._dedup_name(fname, used_names)
-                entries.append((uname, type_str, chunk_data))
+            elif hdr_type == "NONTAMA Machine Language Loader":
+                pos_ff = buf.find(b"\xffNONTAMA", file_start)
+                if pos_ff != -1 and pos_ff + 14 <= n:
+                    _, dlen, _ = struct.unpack("<HHH", buf[pos_ff + 8 : pos_ff + 14])
+                    n_end = min(pos_ff + 14 + dlen + 1, n)
+                    while n_end < n and buf[n_end] in (0x00, 0xFF):
+                        if n_end + 1 < n and (
+                            buf[n_end + 1] in (0x24, 0xD3, 0x9C, 0x3A)
+                            or buf[n_end + 1 : n_end + 9] == b"\xffNONTAMA"
+                        ):
+                            break
+                        n_end += 1
+                    file_end = n_end
+                else:
+                    file_end = n
+                chunk = buf[file_start:file_end]
+                entries.append(
+                    (self._dedup_name(hdr_name, used_names), hdr_type, chunk)
+                )
                 pos = file_end
+                continue
 
-            # 3. ASCII / Sequential Text File (0x9C) - Ctrl-Z (0x1A) consumption
-            elif preamble_byte == 0x9C:
-                file_end = n
-                curr_p = body_start
-                if curr_p + 3 <= n and buf[curr_p : curr_p + 3] == b"\x9c" * 3:
-                    while curr_p < n and buf[curr_p] == 0x9C:
-                        curr_p += 1
-                eof_p = buf.find(b"\x1a", curr_p)
-                file_end = eof_p + 1 if eof_p != -1 else n
-                chunk_data = buf[file_start:file_end]
-                uname = self._dedup_name(fname, used_names)
-                entries.append((uname, type_str, chunk_data))
+            elif hdr_type == "ASCII / Sequential File (0x9C)":
+                sp = hdr_body
+                eof_p = buf.find(b"\x1a", sp)
+                if eof_p != -1:
+                    file_end = eof_p + 1
+                    while file_end < n and buf[file_end] in (0x00, 0xFF):
+                        if file_end + 1 < n and (
+                            buf[file_end + 1] in (0x24, 0xD3, 0x9C, 0x3A)
+                            or buf[file_end + 1 : file_end + 9] == b"\xffNONTAMA"
+                        ):
+                            break
+                        file_end += 1
+                else:
+                    file_end = n
+                chunk = buf[file_start:file_end]
+                entries.append(
+                    (self._dedup_name(hdr_name, used_names), hdr_type, chunk)
+                )
+                pos = file_end
+                continue
+
+            else:
+                # BASIC (0xD3)
+                sp = hdr_body
+                next_start = n
+                while sp < n - 7:
+                    if buf[sp] == 0x3A and sp + 4 <= n:
+                        ah, al, chk = buf[sp + 1], buf[sp + 2], buf[sp + 3]
+                        if (ah + al + chk) & 0xFF == 0 and ah != 0:
+                            if sp > hdr_body and buf[sp - 1] in (0x00, 0xFF):
+                                next_start = sp
+                                break
+                    if buf[sp : sp + 8] == b"\xffNONTAMA":
+                        next_start = sp
+                        break
+                    b = buf[sp]
+                    if b in (0x24, 0xD3, 0x9C):
+                        for plen in (10, 8, 6, 4, 3):
+                            if buf[sp : sp + plen] == bytes([b]) * plen:
+                                idx = sp + plen
+                                while idx < n and buf[idx] == b:
+                                    idx += 1
+                                if idx + 6 <= n:
+                                    name_bytes = buf[idx : idx + 6]
+                                    allow_null = (idx - sp) >= 8
+                                    ok_byte = (
+                                        lambda c: (32 <= c <= 126)
+                                        or (0xA1 <= c <= 0xDF)
+                                        or (allow_null and c == 0)
+                                    )
+                                    if sum(
+                                        1 for c in name_bytes if ok_byte(c)
+                                    ) == 6 and any(
+                                        c not in (0x20, 0x00) for c in name_bytes
+                                    ):
+                                        next_start = sp
+                                        break
+                        if next_start != n:
+                            break
+                    sp += 1
+
+                file_end = next_start
+                chunk = buf[file_start:file_end]
+                entries.append(
+                    (self._dedup_name(hdr_name, used_names), hdr_type, chunk)
+                )
                 pos = file_end
 
         return entries
-
-    @staticmethod
-    def _dedup_name(name: str, used: Dict[str, int]) -> str:
-        if name in used:
-            used[name] += 1
-            return f"{name}_{used[name]}"
-        used[name] = 1
-        return name
 
     @classmethod
     def join(cls, chunks: List[bytes]) -> "CMTFile":
@@ -568,7 +683,6 @@ class CMTFile:
 
 
 def _extract_payload_or_raw(data: bytes) -> bytes:
-    """Helper to extract CMT payload if data is T88 format, or return raw data."""
     if len(data) >= 24 and T88File.is_valid_magic(data[:24]):
         try:
             t88 = T88File.unpack(io.BytesIO(data))
@@ -579,7 +693,6 @@ def _extract_payload_or_raw(data: bytes) -> bytes:
 
 
 def convert_t88_to_cmt(input_path: str, output_path: Optional[str] = None) -> str:
-    """Converts .t88 container to raw .cmt tape dump with 100% byte-exact payload preservation."""
     if output_path is None:
         base, _ = os.path.splitext(input_path)
         output_path = f"{base}.cmt"
@@ -602,7 +715,6 @@ def convert_cmt_to_t88(
     comment: str = "",
     baud: int = 1200,
 ) -> str:
-    """Converts raw .cmt tape dump to .t88 container format."""
     if output_path is None:
         base, _ = os.path.splitext(input_path)
         output_path = f"{base}.t88"
@@ -621,7 +733,6 @@ def convert_cmt_to_t88(
 def split_cmt_file(
     input_path: str, output_dir: Optional[str] = None
 ) -> List[Tuple[str, str, int, str]]:
-    """Splits multi-file .cmt or .t88 into individual numbered .cmt files."""
     with open(input_path, "rb") as f:
         tape_data = f.read()
 
@@ -654,11 +765,6 @@ def split_t88_file(
     default_baud: int = 1200,
     cmt_baud: Optional[int] = None,
 ) -> List[Tuple[str, str, int, str]]:
-    """Splits multi-file .cmt or .t88 into individual numbered .t88 files.
-
-    When input is a .t88 container, preserves original carrier tags (MARK/GAP/SPACE)
-    and per-block baud/timing parameters unless overridden by the `baud` argument.
-    """
     with open(input_path, "rb") as f:
         raw_data = f.read()
 
@@ -690,7 +796,7 @@ def split_t88_file(
                         curr_blocks.append(block)
                 elif block.tag in (T88Tag.MARK, T88Tag.GAP, T88Tag.SPACE):
                     pending_carriers.append(block)
-                elif block.tag == 0x0101:  # DATA block
+                elif block.tag == 0x0101:
                     payload = b""
                     if len(block.data) >= 12:
                         _, _, dlen, _ = struct.unpack("<IIHH", block.data[:12])
@@ -698,7 +804,23 @@ def split_t88_file(
                     else:
                         payload = block.data
 
-                    fname, ftype = CMTFile.extract_file_info(payload)
+                    fname, ftype = "", ""
+                    fn, ft = CMTFile.extract_file_info(payload)
+                    if fn:
+                        fname, ftype = fn, ft
+                    elif b"NONTAMA" in payload[:300]:
+                        idx_n = payload.find(b"NONTAMA")
+                        if idx_n == 0 or (idx_n > 0 and payload[idx_n - 1] == 0xFF):
+                            fname, ftype = "NONTAMA", CMTFile.TYPE_NAMES.get(
+                                0xFF, "NONTAMA Machine Language Loader"
+                            )
+                    elif payload.startswith(b":") and any(
+                        b.tag in (T88Tag.GAP, T88Tag.SPACE) for b in pending_carriers
+                    ):
+                        fname, ftype = "part", CMTFile.TYPE_NAMES.get(
+                            0x3A, "MON Machine Language Records (0x3A)"
+                        )
+
                     if fname:
                         if curr_blocks:
                             uname = CMTFile._dedup_name(curr_name or "part", used_names)
@@ -722,7 +844,6 @@ def split_t88_file(
                 uname = CMTFile._dedup_name(curr_name or "part", used_names)
                 file_sections.append((uname, curr_type or "Binary Data", curr_blocks))
 
-            # If discrete T88 block sequences exist for each file, output them directly
             if len(file_sections) > 1 or (
                 file_sections and len(CMTFile(t88.extract_cmt_payload()).split()) <= 1
             ):
@@ -765,7 +886,7 @@ def split_t88_file(
                                 new_blocks.append(T88Block(b.tag, new_b_data))
                             else:
                                 new_blocks.append(T88Block(b.tag, b.data))
-                        elif b.tag == 0x0101:  # DATA block
+                        elif b.tag == 0x0101:
                             if len(b.data) >= 12:
                                 st, lt, dlen, res = struct.unpack("<IIHH", b.data[:12])
                                 payload = b.data[12 : 12 + dlen]
@@ -806,7 +927,6 @@ def split_t88_file(
         except Exception:
             pass
 
-    # Stream-level split for raw CMT or multi-file single-DATA-block containers
     raw_cmt = _extract_payload_or_raw(raw_data)
     cmt = CMTFile(raw_cmt)
     chunks = cmt.split()
@@ -828,7 +948,6 @@ def split_t88_file(
 
 
 def join_cmt_files(input_paths: List[str], output_path: str) -> str:
-    """Merges multiple files into a single concatenated .cmt file."""
     chunks: List[bytes] = []
     for path in input_paths:
         with open(path, "rb") as f:
@@ -854,8 +973,8 @@ def join_t88_files(
     baud: Optional[int] = None,
     default_baud: int = 1200,
     cmt_baud: Optional[int] = None,
+    chunk_size: int = 32000,
 ) -> str:
-    """Merges multiple files (.t88 or .cmt) into a consolidated .t88 container."""
     combined_blocks: List[T88Block] = []
     combined_blocks.append(T88Block(T88Tag.VERSION, struct.pack("<H", 0x0100)))
 
@@ -909,7 +1028,7 @@ def join_t88_files(
                         else:
                             combined_blocks.append(T88Block(b.tag, b.data))
 
-                    elif b.tag == 0x0101:  # DATA block
+                    elif b.tag == 0x0101:
                         if len(b.data) >= 12:
                             st, lt, dlen, res = struct.unpack("<IIHH", b.data[:12])
                             payload = b.data[12 : 12 + dlen]
@@ -944,7 +1063,6 @@ def join_t88_files(
             except Exception:
                 pass
 
-        # Input is raw CMT data
         effective_cmt_baud = baud if baud is not None else default_baud
         ticks_per_byte = (
             int(round(44 * 1200 / effective_cmt_baud)) if effective_cmt_baud > 0 else 44
@@ -955,11 +1073,19 @@ def join_t88_files(
         )
         current_tick += mark_len
 
-        data_len = len(data)
-        data_ticks = data_len * ticks_per_byte
-        data_header = struct.pack("<IIHH", current_tick, data_ticks, data_len, 0x0000)
-        combined_blocks.append(T88Block(0x0101, data_header + data))
-        current_tick += data_ticks
+        if not data:
+            data_header = struct.pack("<IIHH", current_tick, 0, 0, 0x0000)
+            combined_blocks.append(T88Block(0x0101, data_header))
+        else:
+            for offset in range(0, len(data), chunk_size):
+                chunk = data[offset : offset + chunk_size]
+                data_len = len(chunk)
+                data_ticks = data_len * ticks_per_byte
+                data_header = struct.pack(
+                    "<IIHH", current_tick, data_ticks, data_len, 0x0000
+                )
+                combined_blocks.append(T88Block(0x0101, data_header + chunk))
+                current_tick += data_ticks
 
     combined_blocks.append(T88Block(T88Tag.END, b""))
 
@@ -974,20 +1100,389 @@ def join_t88_files(
     return output_path
 
 
-class TestPC88TapeTool(unittest.TestCase):
-    """Authentic protocol-verified unit tests for PC-8001 / PC-8801 tape operations."""
+def analyze_tape(input_path: str, verbose: bool = False) -> str:
+    with open(input_path, "rb") as f:
+        raw_data = f.read()
 
-    def setUp(self) -> None:
-        """Sets up realistic mock CMT byte streams for all formats."""
-        # 1. Machine Language (0x24 Header + structured 0x3A records with 0-length terminator)
-        self.ml_file = (
-            (b"\x24" * 10 + b"BIN001" + b"\x00\x80\x00\x80")
-            + (b"\x3a" * 10)
-            + (b"\x3a\x00\x80\x08\x21\x00\x80\x3e\x01\xcd\x00\x00\x50")
-            + (b"\x3a\x00\x00\x00\x00")
+    lines: List[str] = []
+    lines.append("=" * 80)
+    lines.append(f"TAPE ANALYSIS REPORT: {os.path.basename(input_path)}")
+    lines.append("=" * 80)
+    lines.append(f"File Size: {len(raw_data):,} bytes")
+
+    is_t88 = len(raw_data) >= 24 and T88File.is_valid_magic(raw_data[:24])
+
+    if is_t88:
+        t88 = T88File.unpack(io.BytesIO(raw_data))
+        lines.append("Format:    .t88 Container (Manuke Station / X88000)")
+        lines.append(f"Magic:     {t88.magic.rstrip(b'\x00')!r}")
+        lines.append(f"Version:   0x{t88.version:04X}")
+        lines.append(f"Blocks:    {len(t88.blocks):,}")
+        meta = t88.extract_metadata()
+        if meta.get("comment"):
+            lines.append(f"Comment:   {meta['comment']}")
+
+        data_blocks = [b for b in t88.blocks if b.tag == 0x0101 and len(b.data) >= 12]
+        if data_blocks:
+            st, lt, dlen, _ = struct.unpack("<IIHH", data_blocks[0].data[:12])
+            if dlen > 0:
+                tpb = lt / dlen
+                est_baud = int(round(44 * 1200 / tpb)) if tpb > 0 else 1200
+                lines.append(f"Est. Baud: {est_baud} baud (~{tpb:.1f} ticks/byte)")
+
+        if verbose:
+            lines.append("\n--- T88 Block Breakdown ---")
+            tag_names = {
+                T88Tag.END: "END",
+                T88Tag.VERSION: "VERSION",
+                T88Tag.COMMENT: "COMMENT",
+                T88Tag.GAP: "GAP",
+                T88Tag.DATA_1200: "DATA",
+                T88Tag.SPACE: "SPACE",
+                T88Tag.MARK: "MARK",
+            }
+            for idx, b in enumerate(t88.blocks):
+                tname = tag_names.get(b.tag, f"0x{b.tag:04X}")
+                if b.tag == 0x0101 and len(b.data) >= 12:
+                    st, lt, dlen, res = struct.unpack("<IIHH", b.data[:12])
+                    pld = b.data[12 : 12 + dlen]
+                    fn, ft = CMTFile.extract_file_info(pld)
+                    fn_str = f" [name='{fn}' type='{ft}']" if fn else ""
+                    lines.append(
+                        f"  #{idx:03d} | {tname:<7} | tick {st:8d}..{st+lt:<8d} ({lt:6d} ticks) | dlen={dlen:5d}{fn_str}"
+                    )
+                elif (
+                    b.tag in (T88Tag.MARK, T88Tag.SPACE, T88Tag.GAP)
+                    and len(b.data) >= 8
+                ):
+                    st, lt = struct.unpack("<II", b.data[:8])
+                    lines.append(
+                        f"  #{idx:03d} | {tname:<7} | tick {st:8d}..{st+lt:<8d} ({lt:6d} ticks)"
+                    )
+                else:
+                    lines.append(
+                        f"  #{idx:03d} | {tname:<7} | len={len(b.data):5d} bytes"
+                    )
+    else:
+        lines.append("Format:    Raw .cmt Sequential Tape Stream")
+
+    cmt_payload = _extract_payload_or_raw(raw_data)
+    cmt_file = CMTFile(cmt_payload)
+    split_items = cmt_file.split()
+
+    lines.append("\n--- Cassette Content / Programs on Tape ---")
+    lines.append(f"Total Programs / Streams Detected: {len(split_items)}")
+    lines.append(
+        f"{'#':<3} | {'Filename':<12} | {'File Format / Type':<35} | {'Size (Bytes)':<12} | Details"
+    )
+    lines.append("-" * 90)
+
+    for idx, (name, ftype, chunk) in enumerate(split_items, start=1):
+        details = []
+        if "BASIC" in ftype:
+            p_idx = 0
+            while p_idx < len(chunk) and chunk[p_idx] in (0xD3,):
+                p_idx += 1
+            p_idx += 6
+            while p_idx < len(chunk) and chunk[p_idx] in (0xD3,):
+                p_idx += 1
+            b_start = p_idx
+            line_nums = []
+            code_sz = len(chunk)
+            while p_idx + 4 <= len(chunk):
+                next_ptr, lnum = struct.unpack("<HH", chunk[p_idx : p_idx + 4])
+                if next_ptr == 0:
+                    code_sz = (p_idx + 2) - b_start
+                    break
+                line_end = chunk.find(b"\x00", p_idx + 4)
+                if line_end == -1:
+                    break
+                line_nums.append(lnum)
+                p_idx = line_end + 1
+            if line_nums:
+                details.append(
+                    f"{len(line_nums)} lines (L{line_nums[0]}..L{line_nums[-1]}), Code: {code_sz:,}B"
+                )
+            else:
+                details.append(f"Code: {len(chunk):,}B")
+        elif "MON" in ftype:
+            p = 0
+            if chunk.startswith(b"\x24"):
+                while p < len(chunk) and chunk[p] in (0x24,):
+                    p += 1
+                if p > 0:
+                    p += 6
+            while p < len(chunk) and chunk[p] in (0x24, 0x00, 0xFF):
+                p += 1
+
+            cur_addr = None
+            start_addr = None
+            min_addr = None
+            max_addr = None
+            recs = 0
+            tot = 0
+
+            while p < len(chunk):
+                while p + 1 < len(chunk) and chunk[p] == 0x3A and chunk[p + 1] == 0x3A:
+                    p += 1
+                if chunk[p] == 0x3A:
+                    if p + 4 <= len(chunk):
+                        ah, al, chk = chunk[p + 1], chunk[p + 2], chunk[p + 3]
+                        if (ah + al + chk) & 0xFF == 0 and ah != 0:
+                            cur_addr = (ah << 8) | al
+                            if start_addr is None:
+                                start_addr = cur_addr
+                            if min_addr is None or cur_addr < min_addr:
+                                min_addr = cur_addr
+                            p += 4
+                            continue
+                    if p + 2 <= len(chunk):
+                        dlen = chunk[p + 1]
+                        if dlen == 0:
+                            p += 3
+                            break
+                        if 0 < dlen and p + 2 + dlen + 1 <= len(chunk):
+                            if cur_addr is not None:
+                                if start_addr is None:
+                                    start_addr = cur_addr
+                                if min_addr is None or cur_addr < min_addr:
+                                    min_addr = cur_addr
+                                cur_end = (cur_addr + dlen - 1) & 0xFFFF
+                                if max_addr is None or cur_end > max_addr:
+                                    max_addr = cur_end
+                                cur_addr = (cur_addr + dlen) & 0xFFFF
+                            tot += dlen
+                            recs += 1
+                            p = p + 2 + dlen + 1
+                            continue
+                p += 1
+
+            if min_addr is not None and max_addr is not None and max_addr >= min_addr:
+                details.append(
+                    f"{recs} records ({tot:,}B loaded), Range: ${min_addr:04X}..${max_addr:04X}"
+                )
+            elif tot > 0:
+                details.append(f"{recs} records ({tot:,}B loaded)")
+            else:
+                details.append(f"MON Records ({len(chunk):,}B)")
+        elif "NONTAMA" in ftype:
+            pos_ff = chunk.find(b"\xffNONTAMA")
+            if pos_ff != -1 and pos_ff + 14 <= len(chunk):
+                l_addr, l_len, e_addr = struct.unpack(
+                    "<HHH", chunk[pos_ff + 8 : pos_ff + 14]
+                )
+                details.append(
+                    f"Load: ${l_addr:04X}..${(l_addr+l_len-1)&0xFFFF:04X} ({l_len:,}B), Exec: ${e_addr:04X}"
+                )
+            else:
+                details.append(f"NONTAMA Stream ({len(chunk):,}B)")
+        else:
+            details.append(f"{len(chunk):,} bytes")
+
+        detail_str = ", ".join(details)
+        lines.append(
+            f"{idx:<3} | {name:<12} | {ftype:<35} | {len(chunk):<12,} | {detail_str}"
         )
 
-        # 2. Tokenized BASIC (0xD3 Header + 0xD3 preamble + linked lines with next_ptr=0)
+    lines.append("-" * 90)
+    return "\n".join(lines)
+
+
+def format_all_help(parser: argparse.ArgumentParser) -> str:
+    out = io.StringIO()
+    parser.print_help(out)
+    out.write("\n\n" + "=" * 80 + "\n")
+    out.write("DETAILED SUBCOMMAND HELP\n")
+    out.write("=" * 80 + "\n")
+
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            for choice, subparser in action.choices.items():
+                out.write(f"\n--- Subcommand: {choice} ---\n")
+                sub_out = io.StringIO()
+                subparser.print_help(sub_out)
+                out.write(sub_out.getvalue().strip() + "\n")
+    return out.getvalue()
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="pc88_tape_tools.py",
+        description="NEC PC-8001 / PC-8801 Cassette Tape Format Utility (.t88 / .cmt)",
+        epilog="Tip: Run '%(prog)s <subcommand> --help' (e.g. 'pc88_tape_tools.py split-t88 --help') "
+        "or '%(prog)s --help-all' to view detailed options for all subcommands at once.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help="Run internal unit tests and exit",
+    )
+    parser.add_argument(
+        "--help-all",
+        action="store_true",
+        help="Show full detailed help for all subcommands at once and exit",
+    )
+
+    subparsers = parser.add_subparsers(
+        dest="command",
+        title="Available Subcommands",
+        metavar="<command>",
+    )
+
+    p_analyze = subparsers.add_parser(
+        "analyze",
+        help="Analyze tape image structure, programs, baud rate, and metadata",
+    )
+    p_analyze.add_argument("input", help="Path to input .t88 or .cmt file to analyze")
+    p_analyze.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Display full T88 block table and detailed diagnostics",
+    )
+
+    p_t2c = subparsers.add_parser(
+        "t2c", help="Convert .t88 container to raw .cmt tape dump"
+    )
+    p_t2c.add_argument("input", help="Path to input .t88 file")
+    p_t2c.add_argument("-o", "--output", help="Path to output .cmt file (optional)")
+
+    p_c2t = subparsers.add_parser(
+        "c2t", help="Convert raw .cmt tape dump to .t88 container"
+    )
+    p_c2t.add_argument("input", help="Path to input .cmt file")
+    p_c2t.add_argument("-o", "--output", help="Path to output .t88 file (optional)")
+    p_c2t.add_argument(
+        "--comment",
+        default="",
+        help="Optional comment metadata string embedded in T88 file",
+    )
+    p_c2t.add_argument(
+        "-b",
+        "--baud",
+        type=int,
+        default=1200,
+        help="Baud rate for output T88 file (default: 1200)",
+    )
+
+    p_split_cmt = subparsers.add_parser(
+        "split-cmt", help="Split multi-file .cmt or .t88 into individual .cmt files"
+    )
+    p_split_cmt.add_argument("input", help="Path to input .cmt or .t88 file")
+    p_split_cmt.add_argument(
+        "-o",
+        "--output-dir",
+        help="Output directory for split files (optional)",
+    )
+
+    p_split_t88 = subparsers.add_parser(
+        "split-t88", help="Split multi-file .cmt or .t88 into individual .t88 files"
+    )
+    p_split_t88.add_argument("input", help="Path to input .cmt or .t88 file")
+    p_split_t88.add_argument(
+        "-o",
+        "--output-dir",
+        help="Output directory for split files (optional)",
+    )
+    p_split_t88.add_argument(
+        "-b",
+        "--baud",
+        type=int,
+        default=None,
+        help="Override baud rate for output .t88 files (preserves original timing by default for .t88)",
+    )
+    p_split_t88.add_argument(
+        "--cmt-baud",
+        "--default-baud",
+        dest="cmt_baud",
+        type=int,
+        default=1200,
+        help="Default baud rate when input is a raw .cmt file (default: 1200)",
+    )
+    p_split_t88.add_argument(
+        "--comment",
+        default="",
+        help="Optional comment metadata string embedded in T88 files",
+    )
+
+    p_join_cmt = subparsers.add_parser(
+        "join-cmt", help="Join multiple files into a single .cmt file"
+    )
+    p_join_cmt.add_argument(
+        "inputs", nargs="+", help="Input .cmt or .t88 files to concatenate"
+    )
+    p_join_cmt.add_argument(
+        "-o", "--output", required=True, help="Path to output merged .cmt file"
+    )
+
+    p_join_t88 = subparsers.add_parser(
+        "join-t88", help="Join multiple files into a single .t88 container"
+    )
+    p_join_t88.add_argument(
+        "inputs", nargs="+", help="Input .cmt or .t88 files to concatenate"
+    )
+    p_join_t88.add_argument(
+        "-o", "--output", required=True, help="Path to output merged .t88 file"
+    )
+    p_join_t88.add_argument(
+        "-b",
+        "--baud",
+        type=int,
+        default=None,
+        help="Override baud rate for ALL output chunks (both .t88 and .cmt inputs)",
+    )
+    p_join_t88.add_argument(
+        "--cmt-baud",
+        "--default-baud",
+        dest="cmt_baud",
+        type=int,
+        default=1200,
+        help="Default baud rate to use for raw .cmt inputs (default: 1200). Does not affect .t88 inputs.",
+    )
+    p_join_t88.add_argument(
+        "--comment",
+        default="",
+        help="Optional comment metadata string embedded in T88 file",
+    )
+
+    return parser
+
+
+class TestPC88TapeTool(unittest.TestCase):
+    @staticmethod
+    def _make_ml_file(name: bytes, addr: int, data: bytes) -> bytes:
+        lead = b"\x24" * 10 + name.ljust(6, b" ")[:6]
+        ah = (addr >> 8) & 0xFF
+        al = addr & 0xFF
+        achk = (0 - (ah + al)) & 0xFF
+        addr_rec = struct.pack("BBBB", 0x3A, ah, al, achk)
+        dlen = len(data)
+        dchk = (0 - (dlen + sum(data))) & 0xFF
+        data_rec = struct.pack("BB", 0x3A, dlen) + data + struct.pack("B", dchk)
+        term_rec = b"\x3a\x00\x00"
+        return lead + addr_rec + data_rec + term_rec
+
+    @staticmethod
+    def _make_mon_o_stream(addr: int, data: bytes) -> bytes:
+        ah = (addr >> 8) & 0xFF
+        al = addr & 0xFF
+        achk = (0 - (ah + al)) & 0xFF
+        addr_rec = struct.pack("BBBB", 0x3A, ah, al, achk)
+        dlen = len(data)
+        dchk = (0 - (dlen + sum(data))) & 0xFF
+        data_rec = struct.pack("BB", 0x3A, dlen) + data + struct.pack("B", dchk)
+        term_rec = b"\x3a\x00\x00"
+        return addr_rec + data_rec + term_rec
+
+    def setUp(self) -> None:
+        self.ml_file = self._make_ml_file(
+            b"BIN001", 0x8000, b"\x21\x00\x80\x3e\x01\xcd\x00\x00"
+        )
+        self.ml_file_2 = self._make_ml_file(b"BIN002", 0x9000, b"\x3e\x01\xcd\x00\x50")
+        self.ml_file_3 = self._make_ml_file(b"BIN003", 0xA000, b"\x3e\x02\xcd\x00\x50")
+        self.three_ml_cmt = self.ml_file + self.ml_file_2 + self.ml_file_3
+
         self.basic_file = (
             (b"\xd3" * 10 + b"PROG01")
             + (b"\xd3" * 10)
@@ -997,29 +1492,12 @@ class TestPC88TapeTool(unittest.TestCase):
             + struct.pack("<H", 0x0000)
         )
 
-        # 3. ASCII Text / Sequential File (0x9C Header + 0x9C preamble + text + 0x1A EOF)
         self.ascii_file = (
-            (b"\x9c" * 10 + b"TEXT01")
-            + (b"\x9c" * 10)
-            + b'10 PRINT "TEST"\r\n20 END\r\n\x1a'
-        )
+            b"\x9c" * 10 + b"TEXT01"
+        ) + b'10 PRINT "TEST"\r\n20 END\r\n\x1a'
 
         self.combined_cmt = self.ml_file + self.basic_file + self.ascii_file
 
-        # 4. Multi-ML tape: Three consecutive MON R files
-        self.ml_file_2 = (
-            (b"\x24\x24\x24" + b"BIN002" + b"\x00\x90\x00\x90")
-            + (b"\x3a\x00\x90\x04\x3e\x01\xcd\x00\x50")
-            + (b"\x3a\x00\x00\x00\x00")
-        )
-        self.ml_file_3 = (
-            (b"\x24\x24\x24" + b"BIN003" + b"\x00\xa0\x00\xa0")
-            + (b"\x3a\x00\xa0\x04\x3e\x02\xcd\x00\x50")
-            + (b"\x3a\x00\x00\x00\x00")
-        )
-        self.three_ml_cmt = self.ml_file + self.ml_file_2 + self.ml_file_3
-
-        # 5. Null-padded CSAVE Program (short name, zero-padded instead of space-padded)
         self.null_padded_basic_file = (
             (b"\xd3" * 10 + b"DOOR\x00\x00")
             + struct.pack("<HH", 0x8010, 10)
@@ -1028,27 +1506,15 @@ class TestPC88TapeTool(unittest.TestCase):
             + struct.pack("<H", 0x0000)
         )
 
-        # 6. Short (non-canonical) sync run immediately followed by bytes that coincidentally resemble a null-padded name
         self.coincidental_short_run = (
             b"\x00" * 4 + b"\x24\x24\x24" + b"DTTT\x00\x00" + b"\x00" * 4
         )
 
-        # 7. Tokenized BASIC followed by two headerless MON O files with 0x3A records
-        self.basic_no_inter_sync = (
-            (b"\xd3" * 10 + b"PROG01")
-            + struct.pack("<HH", 0x8010, 10)
-            + b'\x90 "HELLO WORLD"'
-            + b"\x00"
-            + struct.pack("<H", 0x0000)
-        )
-        self.mon_o_1 = b"\x3a\x00\x80\x04\x01\x02\x03\x04\x00" + b"\x3a\x00\x00"
-        self.mon_o_2 = b"\x3a\x00\x90\x06\x11\x12\x13\x14\x15\x16\x00" + b"\x3a\x00\x00"
-        self.basic_and_two_mon_o_tape = (
-            self.basic_no_inter_sync + self.mon_o_1 + self.mon_o_2
-        )
+        self.mon_o_1 = self._make_mon_o_stream(0x8000, b"\x01\x02\x03\x04")
+        self.mon_o_2 = self._make_mon_o_stream(0x9000, b"\x11\x12\x13\x14\x15\x16")
+        self.basic_and_two_mon_o_tape = self.basic_file + self.mon_o_1 + self.mon_o_2
 
     def test_t88_block_pack_unpack(self) -> None:
-        """Tests T88Block serialization and deserialization."""
         header = struct.pack("<IIHH", 0, 440, 10, 0)
         b_data = T88Block(T88Tag.DATA_1200, header + b"1234567890")
         p_data = b_data.pack()
@@ -1060,103 +1526,101 @@ class TestPC88TapeTool(unittest.TestCase):
             self.assertEqual(u_data.data, header + b"1234567890")
 
     def test_t88_file_pack_unpack(self) -> None:
-        """Tests full authentic T88File packing and unpacking."""
         t88 = T88File.from_cmt_data(self.ml_file, comment="Authentic Test Image")
         packed = t88.pack()
         unpacked = T88File.unpack(io.BytesIO(packed))
-
         self.assertTrue(T88File.is_valid_magic(unpacked.magic))
         self.assertEqual(unpacked.version, 0x0100)
         self.assertEqual(unpacked.extract_cmt_payload(), self.ml_file)
         self.assertEqual(unpacked.extract_metadata()["comment"], "Authentic Test Image")
 
     def test_invalid_t88_header(self) -> None:
-        """Tests exception handling for invalid T88 header."""
         invalid_stream = io.BytesIO(b"INVALID_HEADER_BYTES_TOO_SHORT")
         with self.assertRaises(ValueError):
             T88File.unpack(invalid_stream)
 
     def test_bidirectional_conversion(self) -> None:
-        """Tests bidirectional CMT <-> T88 conversion integrity."""
         t88 = T88File.from_cmt_data(self.combined_cmt)
         cmt_extracted = t88.extract_cmt_payload()
         self.assertEqual(cmt_extracted, self.combined_cmt)
-
         t88_reencoded = T88File.from_cmt_data(cmt_extracted)
         self.assertEqual(t88_reencoded.extract_cmt_payload(), self.combined_cmt)
 
     def test_baud_rate_override(self) -> None:
-        """Tests overriding baud rate when creating T88 containers."""
         t88_1200 = T88File.from_cmt_data(self.ml_file, baud=1200)
         t88_300 = T88File.from_cmt_data(self.ml_file, baud=300)
-
         data_block_1200 = [b for b in t88_1200.blocks if b.tag == 0x0101][0]
         data_block_300 = [b for b in t88_300.blocks if b.tag == 0x0101][0]
-
         _, ticks_1200, dlen_1200, _ = struct.unpack("<IIHH", data_block_1200.data[:12])
         _, ticks_300, dlen_300, _ = struct.unpack("<IIHH", data_block_300.data[:12])
-
         self.assertEqual(dlen_1200, len(self.ml_file))
         self.assertEqual(dlen_300, len(self.ml_file))
         self.assertEqual(ticks_1200, len(self.ml_file) * 44)
         self.assertEqual(ticks_300, len(self.ml_file) * 176)
 
     def test_split_and_join_cmt(self) -> None:
-        """Tests splitting multi-format CMT stream and joining them back."""
         cmt_file = CMTFile(self.combined_cmt)
         split_items = cmt_file.split()
-
         self.assertEqual(len(split_items), 3)
         self.assertEqual(split_items[0][0], "BIN001")
         self.assertEqual(split_items[0][1], "MON Machine Language Header (0x24)")
         self.assertEqual(split_items[0][2], self.ml_file)
-
         self.assertEqual(split_items[1][0], "PROG01")
         self.assertEqual(split_items[1][1], "BASIC Program (0xD3)")
         self.assertEqual(split_items[1][2], self.basic_file)
-
         self.assertEqual(split_items[2][0], "TEXT01")
         self.assertEqual(split_items[2][1], "ASCII / Sequential File (0x9C)")
         self.assertEqual(split_items[2][2], self.ascii_file)
-
         joined = CMTFile.join([item[2] for item in split_items])
         self.assertEqual(joined.data, self.combined_cmt)
 
     def test_three_consecutive_mon_r_files(self) -> None:
-        """Tests that a tape with three consecutive MON R files splits completely without overshooting."""
         cmt_file = CMTFile(self.three_ml_cmt)
         split_items = cmt_file.split()
-
         self.assertEqual(len(split_items), 3)
         self.assertEqual(split_items[0][0], "BIN001")
         self.assertEqual(split_items[0][2], self.ml_file)
-
         self.assertEqual(split_items[1][0], "BIN002")
         self.assertEqual(split_items[1][2], self.ml_file_2)
-
         self.assertEqual(split_items[2][0], "BIN003")
         self.assertEqual(split_items[2][2], self.ml_file_3)
 
     def test_basic_and_headerless_mon_o_files_split(self) -> None:
-        """Tests splitting tape with tokenized BASIC and two headerless MON O files into three files."""
         cmt_file = CMTFile(self.basic_and_two_mon_o_tape)
         split_items = cmt_file.split()
-
         self.assertEqual(len(split_items), 3)
         self.assertEqual(split_items[0][0], "PROG01")
         self.assertEqual(split_items[0][1], "BASIC Program (0xD3)")
-        self.assertEqual(split_items[0][2], self.basic_no_inter_sync)
-
+        self.assertEqual(split_items[0][2], self.basic_file)
         self.assertEqual(split_items[1][0], "part")
         self.assertEqual(split_items[1][1], "MON Machine Language Records (0x3A)")
         self.assertEqual(split_items[1][2], self.mon_o_1)
-
         self.assertEqual(split_items[2][0], "part_2")
         self.assertEqual(split_items[2][1], "MON Machine Language Records (0x3A)")
         self.assertEqual(split_items[2][2], self.mon_o_2)
 
+    def test_stateful_skip_of_coincidental_header_bytes_in_mon_record(self) -> None:
+        fake_header_payload = (
+            b"\x24\x24\x24DTTT\x00\x00" + b"\xd3\xd3\xd3PROG01" + b"A" * 20
+        )
+        dlen = len(fake_header_payload)
+        chk = (0 - (dlen + sum(fake_header_payload))) & 0xFF
+        raw_mon_stream = (
+            b"\x3a\xa0\x00\x60"
+            + struct.pack("BB", 0x3A, dlen)
+            + fake_header_payload
+            + struct.pack("B", chk)
+            + b"\x3a\x00\x00"
+        )
+        cmt_file = CMTFile(raw_mon_stream)
+        split_items = cmt_file.split()
+        self.assertEqual(len(split_items), 1)
+        self.assertEqual(split_items[0][0], "part")
+        self.assertNotIn("DTTT", [s[0] for s in split_items])
+        self.assertNotIn("PROG01", [s[0] for s in split_items])
+        self.assertEqual(split_items[0][2], raw_mon_stream)
+
     def test_null_padded_filename_after_canonical_sync(self) -> None:
-        """Null-padded name IS recognized when preceded by a full sync run."""
         cmt_file = CMTFile(self.null_padded_basic_file)
         split_items = cmt_file.split()
         self.assertEqual(len(split_items), 1)
@@ -1165,14 +1629,43 @@ class TestPC88TapeTool(unittest.TestCase):
         self.assertEqual(split_items[0][2], self.null_padded_basic_file)
 
     def test_no_false_positive_on_short_run_with_nulls(self) -> None:
-        """Null-padded-looking bytes after a short/non-canonical sync run are not treated as header."""
         cmt_file = CMTFile(self.coincidental_short_run)
         split_items = cmt_file.split()
         self.assertEqual(len(split_items), 1)
         self.assertNotEqual(split_items[0][0], "DTTT")
 
+    def test_nontama_loader(self) -> None:
+        basic_loader = (
+            (b"\xd3" * 10 + b"LOADER")
+            + struct.pack("<HH", 0x8010, 10)
+            + b'10 PRINT "LOAD"'
+            + b"\x00"
+            + struct.pack("<H", 0x0000)
+        )
+        nontama_data = (
+            b"\xffNONTAMA"
+            + struct.pack("<HHH", 0x0100, 100, 0x0100)
+            + b"A" * 100
+            + b"\x55"
+        )
+        tape = basic_loader + nontama_data
+        cmt = CMTFile(tape)
+        splits = cmt.split()
+        self.assertEqual(len(splits), 2)
+        self.assertEqual(splits[0][0], "LOADER")
+        self.assertEqual(splits[0][1], "BASIC Program (0xD3)")
+        self.assertEqual(splits[1][0], "NONTAMA")
+        self.assertEqual(splits[1][1], "NONTAMA Machine Language Loader")
+        self.assertEqual(splits[1][2], nontama_data)
+
+    def test_large_payload_16bit_safe_chunking(self) -> None:
+        large_data = b"\xd3" * 10 + b"BIGPRG" + b"X" * 100000
+        t88 = T88File.from_cmt_data(large_data)
+        packed = t88.pack()
+        unpacked = T88File.unpack(io.BytesIO(packed))
+        self.assertEqual(unpacked.extract_cmt_payload(), large_data)
+
     def test_split_t88_with_carrier_blocks(self) -> None:
-        """Tests splitting a T88 container separated by authentic carrier blocks."""
         h1 = struct.pack("<IIHH", 0, 440, len(self.ml_file), 0)
         h2 = struct.pack("<IIHH", 10000, 440, len(self.basic_file), 0)
         blocks = [
@@ -1183,7 +1676,6 @@ class TestPC88TapeTool(unittest.TestCase):
         ]
         t88 = T88File(blocks=blocks)
         packed = t88.pack()
-
         cmt_file = CMTFile(packed)
         split_items = cmt_file.split()
         self.assertEqual(len(split_items), 2)
@@ -1193,11 +1685,10 @@ class TestPC88TapeTool(unittest.TestCase):
     def test_t88_to_t88_split_and_join_preserves_timing_and_carrier_blocks(
         self,
     ) -> None:
-        """Tests that T88 -> T88 split and join preserves original timing and carrier blocks without CMT loss."""
         h1 = struct.pack("<IIHH", 9600, len(self.ml_file) * 44, len(self.ml_file), 0)
         h2 = struct.pack(
             "<IIHH", 25000, len(self.basic_file) * 176, len(self.basic_file), 0
-        )  # 300 baud
+        )
         blocks = [
             T88Block(T88Tag.VERSION, struct.pack("<H", 0x0100)),
             T88Block(T88Tag.MARK, struct.pack("<II", 0, 9600)),
@@ -1212,7 +1703,6 @@ class TestPC88TapeTool(unittest.TestCase):
             t88_in = os.path.join(tmpdir, "input.t88")
             split_dir = os.path.join(tmpdir, "split_t88")
             rejoined_out = os.path.join(tmpdir, "rejoined.t88")
-
             with open(t88_in, "wb") as f:
                 f.write(t88_orig.pack())
 
@@ -1247,7 +1737,6 @@ class TestPC88TapeTool(unittest.TestCase):
             )
 
     def test_join_t88_mixed_inputs_with_cmt_baud(self) -> None:
-        """Tests that join-t88 preserves T88 timings while applying cmt_baud specifically to CMT inputs."""
         with tempfile.TemporaryDirectory() as tmpdir:
             t88_300 = T88File.from_cmt_data(self.basic_file, baud=300)
             p_t88 = os.path.join(tmpdir, "part1.t88")
@@ -1266,15 +1755,12 @@ class TestPC88TapeTool(unittest.TestCase):
 
             data_blocks = [b for b in joined_t88.blocks if b.tag == 0x0101]
             self.assertEqual(len(data_blocks), 2)
-
             _, ticks1, dlen1, _ = struct.unpack("<IIHH", data_blocks[0].data[:12])
             self.assertEqual(ticks1, dlen1 * 176)
-
             _, ticks2, dlen2, _ = struct.unpack("<IIHH", data_blocks[1].data[:12])
             self.assertEqual(ticks2, dlen2 * 88)
 
     def test_t88_to_t88_split_and_join_with_baud_override(self) -> None:
-        """Tests that T88 -> T88 split and join recalculates timing when baud is overridden."""
         with tempfile.TemporaryDirectory() as tmpdir:
             t88_in = os.path.join(tmpdir, "input.t88")
             split_dir = os.path.join(tmpdir, "split_t88")
@@ -1301,8 +1787,18 @@ class TestPC88TapeTool(unittest.TestCase):
                 _, ticks, dlen, _ = struct.unpack("<IIHH", b.data[:12])
                 self.assertEqual(ticks, dlen * 44)
 
+    def test_diagnostic_analyze_mode_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p_cmt = os.path.join(tmpdir, "test.cmt")
+            with open(p_cmt, "wb") as f:
+                f.write(self.combined_cmt)
+            rep = analyze_tape(p_cmt, verbose=False)
+            self.assertIn("TAPE ANALYSIS REPORT", rep)
+            self.assertIn("BIN001", rep)
+            self.assertIn("PROG01", rep)
+            self.assertIn("TEXT01", rep)
+
     def test_help_all_formatting(self) -> None:
-        """Tests that format_all_help produces valid combined help for all subcommands."""
         parser = build_arg_parser()
         all_help = format_all_help(parser)
         self.assertIn("DETAILED SUBCOMMAND HELP", all_help)
@@ -1312,9 +1808,9 @@ class TestPC88TapeTool(unittest.TestCase):
         self.assertIn("Subcommand: split-t88", all_help)
         self.assertIn("Subcommand: join-cmt", all_help)
         self.assertIn("Subcommand: join-t88", all_help)
+        self.assertIn("Subcommand: analyze", all_help)
 
     def test_cli_file_operations(self) -> None:
-        """Tests disk file operations for convert, split, and join (both CMT and T88)."""
         with tempfile.TemporaryDirectory() as tmpdir:
             cmt_in = os.path.join(tmpdir, "input.cmt")
             t88_out = os.path.join(tmpdir, "output.t88")
@@ -1334,7 +1830,6 @@ class TestPC88TapeTool(unittest.TestCase):
 
             res_cmt = convert_t88_to_cmt(t88_out, cmt_out)
             self.assertTrue(os.path.exists(res_cmt))
-
             with open(res_cmt, "rb") as f:
                 self.assertEqual(f.read(), self.combined_cmt)
 
@@ -1347,7 +1842,6 @@ class TestPC88TapeTool(unittest.TestCase):
             split_files = [item[3] for item in split_info]
             res_join = join_cmt_files(split_files, joined_out)
             self.assertTrue(os.path.exists(res_join))
-
             with open(res_join, "rb") as f:
                 self.assertEqual(f.read(), self.combined_cmt)
 
@@ -1360,14 +1854,12 @@ class TestPC88TapeTool(unittest.TestCase):
             split_t88_files = [item[3] for item in split_t88_info]
             res_t88_join = join_t88_files(split_t88_files, joined_t88_out, baud=1200)
             self.assertTrue(os.path.exists(res_t88_join))
-
             with open(res_t88_join, "rb") as f:
                 unpacked_join = T88File.unpack(io.BytesIO(f.read()))
                 self.assertEqual(unpacked_join.extract_cmt_payload(), self.combined_cmt)
 
 
 def format_all_help(parser: argparse.ArgumentParser) -> str:
-    """Formats full help output for the top-level parser and all subparsers."""
     out = io.StringIO()
     parser.print_help(out)
     out.write("\n\n" + "=" * 80 + "\n")
@@ -1385,7 +1877,6 @@ def format_all_help(parser: argparse.ArgumentParser) -> str:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    """Builds the command-line argument parser."""
     parser = argparse.ArgumentParser(
         prog="pc88_tape_tools.py",
         description="NEC PC-8001 / PC-8801 Cassette Tape Format Utility (.t88 / .cmt)",
@@ -1408,6 +1899,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         dest="command",
         title="Available Subcommands",
         metavar="<command>",
+    )
+
+    p_analyze = subparsers.add_parser(
+        "analyze",
+        help="Analyze tape image structure, programs, baud rate, and metadata",
+    )
+    p_analyze.add_argument("input", help="Path to input .t88 or .cmt file to analyze")
+    p_analyze.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Display full T88 block table and detailed diagnostics",
     )
 
     p_t2c = subparsers.add_parser(
@@ -1518,7 +2021,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    """Main execution entry point."""
     parser = build_arg_parser()
     args = parser.parse_args()
 
@@ -1538,7 +2040,11 @@ def main() -> None:
         sys.exit(1)
 
     try:
-        if args.command == "t2c":
+        if args.command == "analyze":
+            report = analyze_tape(args.input, verbose=args.verbose)
+            print(report)
+
+        elif args.command == "t2c":
             out_file = convert_t88_to_cmt(args.input, args.output)
             print(f"[SUCCESS] Converted {args.input} -> {out_file}")
 
