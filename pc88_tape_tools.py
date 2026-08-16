@@ -246,13 +246,11 @@ class T88File:
             blocks.append(T88Block(T88Tag.GAP, struct.pack("<II", current_tick, 480)))
             current_tick += 480
             blocks.append(
-                T88Block(T88Tag.SPACE, struct.pack("<II", current_tick, 4800))
-            )
-            current_tick += 4800
-            blocks.append(
-                T88Block(T88Tag.MARK, struct.pack("<II", current_tick, 12000))
+                T88Block(T88Tag.SPACE, struct.pack("<II", current_tick, 12000))
             )
             current_tick += 12000
+            blocks.append(T88Block(T88Tag.MARK, struct.pack("<II", current_tick, 2400)))
+            current_tick += 2400
             data_header = struct.pack("<IIHH", current_tick, 0, 0, fmt_code)
             blocks.append(T88Block(0x0101, data_header))
         else:
@@ -262,6 +260,17 @@ class T88File:
                 split_items = [("part", "Raw Data / Unknown", cmt_data)]
 
             for file_idx, (name, ftype, chunk) in enumerate(split_items):
+                # Lead-in carrier tone parameters:
+                # - BASIC (0xD3) / ASCII (0x9C): 2.5s SPACE (12000) + 0.5s MARK (2400)
+                # - MON Machine Language (0x24 / 0x3A) / NONTAMA: 1.0s SPACE (4800) + 2.5s MARK (12000)
+                is_mon = (
+                    (len(chunk) > 0 and chunk[0] in (0x24, 0x3A))
+                    or ("MON" in ftype)
+                    or ("NONTAMA" in ftype)
+                )
+                space_len = 4800 if is_mon else 12000
+                mark_len = 12000 if is_mon else 2400
+
                 if file_idx == 0:
                     blocks.append(
                         T88Block(T88Tag.GAP, struct.pack("<II", current_tick, 480))
@@ -272,22 +281,30 @@ class T88File:
                     )
                     current_tick += 480
                     blocks.append(
-                        T88Block(T88Tag.SPACE, struct.pack("<II", current_tick, 4800))
+                        T88Block(
+                            T88Tag.SPACE, struct.pack("<II", current_tick, space_len)
+                        )
                     )
-                    current_tick += 4800
+                    current_tick += space_len
                     blocks.append(
-                        T88Block(T88Tag.MARK, struct.pack("<II", current_tick, 12000))
+                        T88Block(
+                            T88Tag.MARK, struct.pack("<II", current_tick, mark_len)
+                        )
                     )
-                    current_tick += 12000
+                    current_tick += mark_len
                 else:
                     blocks.append(
-                        T88Block(T88Tag.SPACE, struct.pack("<II", current_tick, 4800))
+                        T88Block(
+                            T88Tag.SPACE, struct.pack("<II", current_tick, space_len)
+                        )
                     )
-                    current_tick += 4800
+                    current_tick += space_len
                     blocks.append(
-                        T88Block(T88Tag.MARK, struct.pack("<II", current_tick, 12000))
+                        T88Block(
+                            T88Tag.MARK, struct.pack("<II", current_tick, mark_len)
+                        )
                     )
-                    current_tick += 12000
+                    current_tick += mark_len
 
                 hdr_len = 0
                 if len(chunk) >= 9 and chunk[0] in (0x24, 0xD3, 0x9C):
@@ -465,7 +482,7 @@ class CMTFile:
             # 1. Custom Bootstrap Loader (0xFF NONTAMA)
             is_nontama = False
             nt_p = pos
-            while nt_p < min(pos + 256, n - 7):
+            while nt_p < min(pos + 300, n - 7):
                 if buf[nt_p : nt_p + 8] == b"\xffNONTAMA" or (
                     nt_p == 0 and buf[0:7] == b"NONTAMA"
                 ):
@@ -731,7 +748,11 @@ class CMTFile:
                                 next_start = sp
                                 break
                     if buf[sp : sp + 8] == b"\xffNONTAMA":
-                        next_start = sp
+                        next_start = (
+                            sp - 256
+                            if (sp >= 256 and buf[sp - 256 : sp] == b"\x00" * 256)
+                            else sp
+                        )
                         break
                     b = buf[sp]
                     if b in (0x24, 0xD3, 0x9C):
@@ -1951,7 +1972,7 @@ class TestPC88TapeTool(unittest.TestCase):
         self.assertEqual(dlen_hdr + dlen_body, len(self.basic_file))
         self.assertEqual(fmt_body, 0x01CC)
         _, mark_burst_len_lead = struct.unpack("<II", mark_blocks_1200[0].data[:8])
-        self.assertEqual(mark_burst_len_lead, 12000)
+        self.assertEqual(mark_burst_len_lead, 2400)
         _, mark_burst_len_inter = struct.unpack("<II", mark_blocks_1200[1].data[:8])
         self.assertEqual(mark_burst_len_inter, 960)
 
@@ -2033,167 +2054,6 @@ class TestPC88TapeTool(unittest.TestCase):
             with open(res_t88_join, "rb") as f:
                 unpacked_join = T88File.unpack(io.BytesIO(f.read()))
                 self.assertEqual(unpacked_join.extract_cmt_payload(), self.combined_cmt)
-
-
-def format_all_help(parser: argparse.ArgumentParser) -> str:
-    out = io.StringIO()
-    parser.print_help(out)
-    out.write("\n\n" + "=" * 80 + "\n")
-    out.write("DETAILED SUBCOMMAND HELP\n")
-    out.write("=" * 80 + "\n")
-
-    for action in parser._actions:
-        if isinstance(action, argparse._SubParsersAction):
-            for choice, subparser in action.choices.items():
-                out.write(f"\n--- Subcommand: {choice} ---\n")
-                sub_out = io.StringIO()
-                subparser.print_help(sub_out)
-                out.write(sub_out.getvalue().strip() + "\n")
-    return out.getvalue()
-
-
-def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="pc88_tape_tools.py",
-        description="NEC PC-8001 / PC-8801 Cassette Tape Format Utility (.t88 / .cmt)",
-        epilog="Tip: Run '%(prog)s <subcommand> --help' (e.g. 'pc88_tape_tools.py split-t88 --help') "
-        "or '%(prog)s --help-all' to view detailed options for all subcommands at once.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    parser.add_argument(
-        "--test",
-        action="store_true",
-        help="Run internal unit tests and exit",
-    )
-    parser.add_argument(
-        "--help-all",
-        action="store_true",
-        help="Show full detailed help for all subcommands at once and exit",
-    )
-
-    subparsers = parser.add_subparsers(
-        dest="command",
-        title="Available Subcommands",
-        metavar="<command>",
-    )
-
-    p_analyze = subparsers.add_parser(
-        "analyze",
-        help="Analyze tape image structure, programs, baud rate, and metadata",
-    )
-    p_analyze.add_argument("input", help="Path to input .t88 or .cmt file to analyze")
-    p_analyze.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="Display full T88 block table and detailed diagnostics",
-    )
-
-    p_t2c = subparsers.add_parser(
-        "t2c", help="Convert .t88 container to raw .cmt tape dump"
-    )
-    p_t2c.add_argument("input", help="Path to input .t88 file")
-    p_t2c.add_argument("-o", "--output", help="Path to output .cmt file (optional)")
-
-    p_c2t = subparsers.add_parser(
-        "c2t", help="Convert raw .cmt tape dump to .t88 container"
-    )
-    p_c2t.add_argument("input", help="Path to input .cmt file")
-    p_c2t.add_argument("-o", "--output", help="Path to output .t88 file (optional)")
-    p_c2t.add_argument(
-        "--comment",
-        default="",
-        help="Optional comment metadata string embedded in T88 file",
-    )
-    p_c2t.add_argument(
-        "-b",
-        "--baud",
-        type=int,
-        default=1200,
-        help="Baud rate for output T88 file (default: 1200)",
-    )
-
-    p_split_cmt = subparsers.add_parser(
-        "split-cmt", help="Split multi-file .cmt or .t88 into individual .cmt files"
-    )
-    p_split_cmt.add_argument("input", help="Path to input .cmt or .t88 file")
-    p_split_cmt.add_argument(
-        "-o",
-        "--output-dir",
-        help="Output directory for split files (optional)",
-    )
-
-    p_split_t88 = subparsers.add_parser(
-        "split-t88", help="Split multi-file .cmt or .t88 into individual .t88 files"
-    )
-    p_split_t88.add_argument("input", help="Path to input .cmt or .t88 file")
-    p_split_t88.add_argument(
-        "-o",
-        "--output-dir",
-        help="Output directory for split files (optional)",
-    )
-    p_split_t88.add_argument(
-        "-b",
-        "--baud",
-        type=int,
-        default=None,
-        help="Override baud rate for output .t88 files (preserves original timing by default for .t88)",
-    )
-    p_split_t88.add_argument(
-        "--cmt-baud",
-        "--default-baud",
-        dest="cmt_baud",
-        type=int,
-        default=1200,
-        help="Default baud rate when input is a raw .cmt file (default: 1200)",
-    )
-    p_split_t88.add_argument(
-        "--comment",
-        default="",
-        help="Optional comment metadata string embedded in T88 files",
-    )
-
-    p_join_cmt = subparsers.add_parser(
-        "join-cmt", help="Join multiple files into a single .cmt file"
-    )
-    p_join_cmt.add_argument(
-        "inputs", nargs="+", help="Input .cmt or .t88 files to concatenate"
-    )
-    p_join_cmt.add_argument(
-        "-o", "--output", required=True, help="Path to output merged .cmt file"
-    )
-
-    p_join_t88 = subparsers.add_parser(
-        "join-t88", help="Join multiple files into a single .t88 container"
-    )
-    p_join_t88.add_argument(
-        "inputs", nargs="+", help="Input .cmt or .t88 files to concatenate"
-    )
-    p_join_t88.add_argument(
-        "-o", "--output", required=True, help="Path to output merged .t88 file"
-    )
-    p_join_t88.add_argument(
-        "-b",
-        "--baud",
-        type=int,
-        default=None,
-        help="Override baud rate for ALL output chunks (both .t88 and .cmt inputs)",
-    )
-    p_join_t88.add_argument(
-        "--cmt-baud",
-        "--default-baud",
-        dest="cmt_baud",
-        type=int,
-        default=1200,
-        help="Default baud rate to use for raw .cmt inputs (default: 1200). Does not affect .t88 inputs.",
-    )
-    p_join_t88.add_argument(
-        "--comment",
-        default="",
-        help="Optional comment metadata string embedded in T88 file",
-    )
-
-    return parser
 
 
 def main() -> None:
