@@ -1,4 +1,6 @@
-# pc88_tape_tools
+# pc88_tape_tools, t882wav, wav2t88
+
+Convert between t88, cmt, and wav, and split/join/analyze/synthesize/demodulate PC-8001 and PC-8801 tape files
 
 Comprehensive cassette tape audio and container toolkit for the **NEC PC-8001 / PC-8801** family of computers (PC-8001, PC-8001mkII, PC-8001mkIISR, PC-8801, PC-8801mkII, PC-8801mkIISR).
 
