@@ -1243,7 +1243,8 @@ def analyze_tape(input_path: str, verbose: bool = False) -> str:
     if is_t88:
         t88 = T88File.unpack(io.BytesIO(raw_data))
         lines.append("Format:    .t88 Container (Manuke Station / X88000)")
-        lines.append(f"Magic:     {t88.magic.rstrip(b'\x00')!r}")
+        magic_trimmed = t88.magic.rstrip(b"\x00")
+        lines.append(f"Magic:     {magic_trimmed!r}")
         lines.append(f"Version:   0x{t88.version:04X}")
         lines.append(f"Blocks:    {len(t88.blocks):,}")
         meta = t88.extract_metadata()

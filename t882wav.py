@@ -46,6 +46,7 @@ import os
 import io
 import math
 import struct
+import array
 import argparse
 from typing import BinaryIO, Optional, Tuple, List, Generator
 
@@ -211,13 +212,32 @@ class StreamingWavWriter:
             return
 
         num_frames = len(mono_floats)
-        # Quantize to 16-bit signed integer [-32768, 32767]
-        quantized = [
-            max(-32768, min(32767, int(round(s * 32767.0)))) for s in mono_floats
-        ]
+        # Quantize to 16-bit signed integer [-32768, 32767].
+        # Manual clamp (instead of calling the max()/min() builtins per-sample)
+        # and array.array (instead of struct.pack(*huge_arg_list)) are both
+        # pure speed optimizations; the rounding/clamping semantics are
+        # identical to the original implementation bit-for-bit.
+        _round = round
+        quantized = []
+        qappend = quantized.append
+        for s in mono_floats:
+            v = int(_round(s * 32767.0))
+            if v > 32767:
+                v = 32767
+            elif v < -32768:
+                v = -32768
+            qappend(v)
+
+        # array.array uses native machine byte order, but WAV PCM data must be
+        # little-endian; byteswap on big-endian hosts to preserve correctness.
+        def _to_le_bytes(int_list):
+            arr = array.array("h", int_list)
+            if sys.byteorder == "big":
+                arr.byteswap()
+            return arr.tobytes()
 
         if self.channels == 1:
-            raw_bytes = struct.pack(f"<{num_frames}h", *quantized)
+            raw_bytes = _to_le_bytes(quantized)
         elif self.channels == 2:
             stereo_pcm = []
             smode = self.stereo_mode
@@ -236,9 +256,9 @@ class StreamingWavWriter:
             else:
                 for v in quantized:
                     stereo_pcm.extend([v, v])
-            raw_bytes = struct.pack(f"<{num_frames * 2}h", *stereo_pcm)
+            raw_bytes = _to_le_bytes(stereo_pcm)
         else:
-            raw_bytes = struct.pack(f"<{num_frames}h", *quantized)
+            raw_bytes = _to_le_bytes(quantized)
 
         self.out.write(raw_bytes)
         self.total_frames_written += num_frames
@@ -324,6 +344,17 @@ class T88ToWavSynthesizer:
         self.dc_x1 = 0.0
         self.dc_y1 = 0.0
 
+        # Normalize the mode alias group once (instead of re-checking tuple
+        # membership on every single sample inside the hot synthesis loops).
+        if self.mode in ("ideal", "square", "direct"):
+            self._kind = "ideal"
+        elif self.mode in ("tape", "cassette", "readback"):
+            self._kind = "tape"
+        elif self.mode in ("shaped", "pc", "circuit"):
+            self._kind = "shaped"
+        else:
+            self._kind = "raw"
+
     def shape_sample(self, phase: float) -> float:
         """
         Transforms instantaneous phase into an audio sample based on active mode.
@@ -363,36 +394,117 @@ class T88ToWavSynthesizer:
             self.current_time += self.dt
         return samples
 
+    def _gen_wave(
+        self, two_pi_f: float, duration_sec: float, apply_ramp: bool
+    ) -> List[float]:
+        """
+        Shared sample-generation core used by generate_tone() and
+        generate_uart_data(). This performs exactly the same arithmetic, in
+        exactly the same order, as calling shape_sample() once per sample in
+        a Python for-loop -- it is just written as one specialized tight
+        loop per waveform kind so that:
+          * self.<attr> lookups become local variables,
+          * math.sin/tanh/cos become local references,
+          * the mode dispatch (originally re-checked on every sample inside
+            shape_sample) happens once per call instead of once per sample,
+          * shape_sample()'s per-sample Python function-call overhead is
+            removed entirely.
+        None of this changes the floating point operation order, so output
+        is bit-for-bit identical to the original implementation.
+        """
+        if duration_sec <= 0.0:
+            return []
+        samples = []
+        append = samples.append
+        dt = self.dt
+        amplitude = self.amplitude
+        invert = self.invert
+        kind = self._kind
+        ramp_dur = 0.0025  # 2.5 ms soft envelope onset
+
+        t = self.current_time
+        t_start = t
+        t_end = t + duration_sec
+
+        _sin = math.sin
+
+        if kind == "tape":
+            _tanh = math.tanh
+            _cos = math.cos
+            pi = math.pi
+            while t < t_end:
+                t_rel = t - t_start
+                phase = two_pi_f * t_rel
+                sin_val = _sin(phase)
+                base = _tanh((sin_val + 0.15 * _sin(2.0 * phase)) * 1.8)
+                out = base * amplitude
+                if invert:
+                    out = -out
+                if apply_ramp and t_rel < ramp_dur:
+                    out *= 0.5 * (1.0 - _cos(pi * (t_rel / ramp_dur)))
+                append(out)
+                t += dt
+        elif kind == "shaped":
+            _cos = math.cos
+            pi = math.pi
+            rc_lp = self.rc_lp
+            lp_alpha = self.lp_alpha
+            dc_x1 = self.dc_x1
+            dc_y1 = self.dc_y1
+            while t < t_end:
+                t_rel = t - t_start
+                phase = two_pi_f * t_rel
+                sin_val = _sin(phase)
+                raw = 1.0 if sin_val >= 0.0 else -1.0
+                rc_lp += lp_alpha * (raw - rc_lp)
+                hp_y = rc_lp - dc_x1 + 0.995 * dc_y1
+                dc_x1 = rc_lp
+                dc_y1 = hp_y
+                out = hp_y * amplitude
+                if invert:
+                    out = -out
+                if apply_ramp and t_rel < ramp_dur:
+                    out *= 0.5 * (1.0 - _cos(pi * (t_rel / ramp_dur)))
+                append(out)
+                t += dt
+            self.rc_lp = rc_lp
+            self.dc_x1 = dc_x1
+            self.dc_y1 = dc_y1
+        elif kind == "ideal":
+            # apply_ramp is always False for "ideal" (see generate_tone),
+            # matching the original mode-membership check.
+            while t < t_end:
+                t_rel = t - t_start
+                phase = two_pi_f * t_rel
+                sin_val = _sin(phase)
+                base = 1.0 if sin_val >= 0.0 else -1.0
+                out = base * amplitude
+                if invert:
+                    out = -out
+                append(out)
+                t += dt
+        else:
+            while t < t_end:
+                t_rel = t - t_start
+                phase = two_pi_f * t_rel
+                out = _sin(phase) * amplitude
+                if invert:
+                    out = -out
+                append(out)
+                t += dt
+
+        self.current_time = t
+        return samples
+
     def generate_tone(
         self, freq: float, duration_sec: float, ramp_in: bool = False
     ) -> List[float]:
         if duration_sec <= 0.0:
             return []
-        samples = []
         actual_freq = freq * self.speed
-        t_end = self.current_time + duration_sec
-        t_start = self.current_time
         two_pi_f = 2.0 * math.pi * actual_freq
-        apply_ramp = ramp_in and self.mode in (
-            "tape",
-            "cassette",
-            "readback",
-            "shaped",
-            "pc",
-            "circuit",
-        )
-        ramp_dur = 0.0025  # 2.5 ms soft envelope onset
-
-        while self.current_time < t_end:
-            t_rel = self.current_time - t_start
-            phase = two_pi_f * t_rel
-            s = self.shape_sample(phase)
-            if apply_ramp and t_rel < ramp_dur:
-                envelope = 0.5 * (1.0 - math.cos(math.pi * (t_rel / ramp_dur)))
-                s *= envelope
-            samples.append(s)
-            self.current_time += self.dt
-        return samples
+        apply_ramp = ramp_in and self._kind in ("tape", "shaped")
+        return self._gen_wave(two_pi_f, duration_sec, apply_ramp)
 
     def generate_uart_data(self, data_bytes: bytes, baud: int) -> List[float]:
         if not data_bytes:
@@ -410,13 +522,7 @@ class T88ToWavSynthesizer:
             bits = [0] + [(b >> i) & 1 for i in range(8)] + [1, 1]
             for bit in bits:
                 two_pi_f = two_pi_mark if bit == 1 else two_pi_space
-                t_end = self.current_time + bit_dur
-                t_start = self.current_time
-                while self.current_time < t_end:
-                    t_rel = self.current_time - t_start
-                    phase = two_pi_f * t_rel
-                    samples.append(self.shape_sample(phase))
-                    self.current_time += self.dt
+                samples.extend(self._gen_wave(two_pi_f, bit_dur, False))
         return samples
 
 
@@ -484,16 +590,40 @@ def convert_t88_to_wav(
     last_progress_tick = 0
     after_gap = True
 
-    # Stream buffer for writing in uniform chunks
+    # Stream buffer for writing in uniform chunks.
+    #
+    # NOTE: sample_buffer is *not* immediately shrunk from the front after
+    # every write. The original implementation did
+    # `sample_buffer = sample_buffer[num_to_write:]` on every iteration,
+    # which reallocates and copies the entire remaining tail every time --
+    # O(remaining) per chunk. Since a single T88 tag (e.g. a multi-second
+    # MARK/leader tone) can expand to hundreds of thousands of samples
+    # before flush_samples() is even called, that turned into O(n^2) work
+    # for long tones and was overwhelmingly the actual hot spot (confirmed
+    # via profiling -- not the per-sample synthesis math). Instead we track
+    # a read position (buf_pos) and only periodically compact the buffer,
+    # which keeps the same O(1)-amortized/bounded-memory streaming design
+    # the docstring promises without the quadratic blowup.
     sample_buffer: List[float] = []
+    buf_pos = 0
+    COMPACT_THRESHOLD = 1 << 16  # 65536 samples
 
     def flush_samples(force: bool = False):
-        nonlocal sample_buffer
-        while len(sample_buffer) >= chunk_frames or (force and sample_buffer):
-            num_to_write = len(sample_buffer) if force else chunk_frames
-            chunk = sample_buffer[:num_to_write]
-            writer.write_pcm_samples(chunk)
-            sample_buffer = sample_buffer[num_to_write:]
+        nonlocal sample_buffer, buf_pos
+        n = len(sample_buffer)
+        while (n - buf_pos) >= chunk_frames or (force and buf_pos < n):
+            num_to_write = (n - buf_pos) if force else chunk_frames
+            end = buf_pos + num_to_write
+            writer.write_pcm_samples(sample_buffer[buf_pos:end])
+            buf_pos = end
+        if buf_pos == n:
+            # Fully drained: O(1) reset instead of a slice/copy.
+            sample_buffer = []
+            buf_pos = 0
+        elif buf_pos >= COMPACT_THRESHOLD:
+            # Infrequent compaction keeps memory bounded; amortized O(1).
+            sample_buffer = sample_buffer[buf_pos:]
+            buf_pos = 0
 
     for tag_id, length, payload in reader.iter_blocks():
         if tag_id in (T88Tag.GAP, T88Tag.SPACE, T88Tag.MARK):
@@ -625,7 +755,7 @@ def run_inspector(in_stream: BinaryIO, out_stream=sys.stdout):
         "======================================================================",
         file=out_stream,
     )
-    NUL = b'\x00'
+    NUL = b"\x00"
     print(f"Magic Signature: {reader.header_bytes.rstrip(NUL)!r}", file=out_stream)
 
     total_ticks = 0
