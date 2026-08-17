@@ -260,9 +260,6 @@ class T88File:
                 split_items = [("part", "Raw Data / Unknown", cmt_data)]
 
             for file_idx, (name, ftype, chunk) in enumerate(split_items):
-                # Lead-in carrier tone parameters:
-                # - BASIC (0xD3) / ASCII (0x9C): 2.5s SPACE (12000) + 0.5s MARK (2400)
-                # - MON Machine Language (0x24 / 0x3A) / NONTAMA: 1.0s SPACE (4800) + 2.5s MARK (12000)
                 is_mon = (
                     (len(chunk) > 0 and chunk[0] in (0x24, 0x3A))
                     or ("MON" in ftype)
@@ -893,73 +890,88 @@ def split_t88_file(
     if len(raw_data) >= 24 and T88File.is_valid_magic(raw_data[:24]):
         try:
             t88 = T88File.unpack(io.BytesIO(raw_data))
-            file_sections: List[Tuple[str, str, List[T88Block]]] = []
-            pending_carriers: List[T88Block] = []
-            curr_blocks: List[T88Block] = []
-            curr_name = ""
-            curr_type = ""
-            used_names: Dict[str, int] = {}
+            blocks = [
+                b for b in t88.blocks if b.tag not in (T88Tag.VERSION, T88Tag.END)
+            ]
 
-            for block in t88.blocks:
-                if block.tag in (T88Tag.VERSION, T88Tag.END):
-                    continue
-                elif block.tag == T88Tag.COMMENT:
-                    if not comment:
-                        curr_blocks.append(block)
-                elif block.tag in (T88Tag.MARK, T88Tag.GAP, T88Tag.SPACE):
-                    pending_carriers.append(block)
-                elif block.tag == 0x0101:
+            # Detect file boundaries by identifying header DATA blocks
+            header_entries: List[Tuple[int, str, str]] = []
+            for idx, b in enumerate(blocks):
+                if b.tag == 0x0101:
                     payload = b""
-                    if len(block.data) >= 12:
-                        _, _, dlen, _ = struct.unpack("<IIHH", block.data[:12])
-                        payload = block.data[12 : 12 + dlen]
+                    if len(b.data) >= 12:
+                        _, _, dlen, _ = struct.unpack("<IIHH", b.data[:12])
+                        payload = b.data[12 : 12 + dlen]
                     else:
-                        payload = block.data
+                        payload = b.data
 
-                    fname, ftype = "", ""
                     fn, ft = CMTFile.extract_file_info(payload)
                     if fn:
-                        fname, ftype = fn, ft
+                        header_entries.append((idx, fn, ft))
                     elif b"NONTAMA" in payload[:300]:
                         idx_n = payload.find(b"NONTAMA")
                         if idx_n == 0 or (idx_n > 0 and payload[idx_n - 1] == 0xFF):
-                            fname, ftype = "NONTAMA", CMTFile.TYPE_NAMES.get(
-                                0xFF, "NONTAMA Machine Language Loader"
+                            header_entries.append(
+                                (
+                                    idx,
+                                    "NONTAMA",
+                                    CMTFile.TYPE_NAMES.get(
+                                        0xFF, "NONTAMA Machine Language Loader"
+                                    ),
+                                )
                             )
-                    elif payload.startswith(b":") and any(
-                        b.tag in (T88Tag.GAP, T88Tag.SPACE) for b in pending_carriers
+                    elif not header_entries:
+                        header_entries.append((idx, "part", "Binary Data"))
+
+            if header_entries:
+                # Partition carrier blocks between File N trailer and File N+1 lead-in
+                split_cuts = [0]
+                for k in range(len(header_entries) - 1):
+                    prev_hdr_idx = header_entries[k][0]
+                    next_hdr_idx = header_entries[k + 1][0]
+
+                    carrier_start = prev_hdr_idx + 1
+                    while (
+                        carrier_start < next_hdr_idx
+                        and blocks[carrier_start].tag == 0x0101
                     ):
-                        fname, ftype = "part", CMTFile.TYPE_NAMES.get(
-                            0x3A, "MON Machine Language Records (0x3A)"
-                        )
+                        carrier_start += 1
 
-                    if fname:
-                        if curr_blocks:
-                            uname = CMTFile._dedup_name(curr_name or "part", used_names)
-                            file_sections.append(
-                                (uname, curr_type or "Binary Data", curr_blocks)
-                            )
-                            curr_blocks = []
-                        curr_name = fname
-                        curr_type = ftype
-                        curr_blocks.extend(pending_carriers)
-                        pending_carriers = []
-                        curr_blocks.append(block)
+                    carrier_blocks = blocks[carrier_start:next_hdr_idx]
+                    gap_offset = -1
+                    for ci, cb in enumerate(carrier_blocks):
+                        if cb.tag == T88Tag.GAP:
+                            gap_offset = ci
+
+                    if gap_offset != -1:
+                        cut_idx = carrier_start + gap_offset + 1
                     else:
-                        curr_blocks.extend(pending_carriers)
-                        pending_carriers = []
-                        curr_blocks.append(block)
+                        if (
+                            len(carrier_blocks) >= 2
+                            and carrier_blocks[-2].tag == T88Tag.SPACE
+                            and carrier_blocks[-1].tag == T88Tag.MARK
+                        ):
+                            cut_idx = next_hdr_idx - 2
+                        elif (
+                            len(carrier_blocks) >= 1
+                            and carrier_blocks[-1].tag == T88Tag.MARK
+                        ):
+                            cut_idx = next_hdr_idx - 1
+                        else:
+                            cut_idx = carrier_start + len(carrier_blocks) // 2
 
-            if curr_blocks:
-                curr_blocks.extend(pending_carriers)
-                pending_carriers = []
-                uname = CMTFile._dedup_name(curr_name or "part", used_names)
-                file_sections.append((uname, curr_type or "Binary Data", curr_blocks))
+                    split_cuts.append(cut_idx)
 
-            if len(file_sections) > 1 or (
-                file_sections and len(CMTFile(t88.extract_cmt_payload()).split()) <= 1
-            ):
-                for idx, (fname, ftype, blocks) in enumerate(file_sections, start=1):
+                split_cuts.append(len(blocks))
+
+                used_names: Dict[str, int] = {}
+                for k in range(len(header_entries)):
+                    fname_raw = header_entries[k][1]
+                    ftype = header_entries[k][2]
+                    sec_blocks = blocks[split_cuts[k] : split_cuts[k + 1]]
+
+                    uname = CMTFile._dedup_name(fname_raw or "part", used_names)
+
                     new_blocks: List[T88Block] = []
                     new_blocks.append(
                         T88Block(T88Tag.VERSION, struct.pack("<H", 0x0100))
@@ -974,18 +986,18 @@ def split_t88_file(
 
                     timing_blocks = [
                         b
-                        for b in blocks
+                        for b in sec_blocks
                         if b.tag in (T88Tag.GAP, T88Tag.SPACE, T88Tag.MARK, 0x0101)
                     ]
                     min_tick = 0
                     for tb in timing_blocks:
                         if len(tb.data) >= 8:
-                            st, _ = struct.unpack("<II", tb.data[:8])
+                            st = struct.unpack("<II", tb.data[:8])[0]
                             min_tick = st
                             break
 
                     curr_tick = 0
-                    for b in blocks:
+                    for b in sec_blocks:
                         if b.tag in (T88Tag.GAP, T88Tag.SPACE, T88Tag.MARK):
                             if len(b.data) >= 8:
                                 st, lt = struct.unpack("<II", b.data[:8])
@@ -1020,6 +1032,9 @@ def split_t88_file(
                                 new_blocks.append(T88Block(b.tag, new_b_data))
                             else:
                                 new_blocks.append(T88Block(b.tag, b.data))
+                        elif b.tag == T88Tag.COMMENT:
+                            if not comment:
+                                new_blocks.append(T88Block(b.tag, b.data))
                         else:
                             new_blocks.append(T88Block(b.tag, b.data))
 
@@ -1029,12 +1044,12 @@ def split_t88_file(
                     )
                     t88_bytes = split_t88.pack()
 
-                    clean_name = fname[:-4] if fname.lower().endswith(".t88") else fname
-                    out_name = f"{idx:02d}_{clean_name}.t88"
+                    clean_name = uname[:-4] if uname.lower().endswith(".t88") else uname
+                    out_name = f"{k+1:02d}_{clean_name}.t88"
                     out_path = os.path.join(output_dir, out_name)
                     with open(out_path, "wb") as out_f:
                         out_f.write(t88_bytes)
-                    summary_info.append((fname, ftype, len(t88_bytes), out_path))
+                    summary_info.append((uname, ftype, len(t88_bytes), out_path))
 
                 return summary_info
         except Exception:
@@ -1118,15 +1133,9 @@ def join_t88_files(
                 for b in file_blocks:
                     if b.tag in (T88Tag.GAP, T88Tag.SPACE, T88Tag.MARK, 0x0101):
                         if len(b.data) >= 8:
-                            st, _ = struct.unpack("<II", b.data[:8])
+                            st = struct.unpack("<II", b.data[:8])[0]
                             min_tick = st
                             break
-
-                if path_idx > 0:
-                    combined_blocks.append(
-                        T88Block(T88Tag.GAP, struct.pack("<II", current_tick, 9600))
-                    )
-                    current_tick += 9600
 
                 file_start_tick = current_tick
                 file_max_end = current_tick
@@ -1900,8 +1909,6 @@ class TestPC88TapeTool(unittest.TestCase):
             self.assertEqual(len(data_blocks), 3)
             tot_dlen = sum(struct.unpack("<IIHH", b.data[:12])[2] for b in data_blocks)
             self.assertEqual(tot_dlen, len(self.basic_file) + len(self.ml_file))
-            gap_blocks = [b for b in joined_t88.blocks if b.tag == T88Tag.GAP]
-            self.assertGreaterEqual(len(gap_blocks), 1)
 
     def test_t88_to_t88_split_and_join_with_baud_override(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
