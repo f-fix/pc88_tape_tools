@@ -19,14 +19,14 @@ Hardware & Format Specifications:
 - T88 Format Codes: 0x01CC for 1200 baud (44 ticks/byte), 0x00CC for 600 baud (88 ticks/byte).
 """
 
-import sys
-import os
+import argparse
 import io
 import math
-import struct
+import os
 import random
-import argparse
-from typing import BinaryIO, Optional, Tuple, List
+import struct
+import sys
+from typing import BinaryIO, List, Optional, Tuple
 
 
 # ============================================================================
@@ -35,6 +35,7 @@ from typing import BinaryIO, Optional, Tuple, List
 
 
 class StreamingWavReader:
+
     def __init__(self, stream: BinaryIO, channel_mode: str = "auto"):
         self.stream = stream
         self.channel_mode = channel_mode.lower()
@@ -164,15 +165,15 @@ class StreamingWavReader:
 
 
 class BaudAgnosticPulseRecognizer:
-    """
-    Analog Front-End & Zero-Crossing Full-Cycle Pulse Extractor:
+    """Analog Front-End & Zero-Crossing Full-Cycle Pulse Extractor:
+
     - Zero baud awareness: only extracts 2400 Hz Mark ('M') and 1200 Hz Space ('S') cycles.
     - Sub-sample linear interpolation measures exact zero crossing timestamps.
     - AC-coupling DC blocker (~180 Hz cutoff).
     - 2nd-order Biquad Bandpass filter (600 - 3600 Hz).
     - Rapid-recovery AGC preventing 1200 Hz Space from masking quiet 2400 Hz Mark.
     - Polarity-independent (+, -) and (-, +) full-wave pairing.
-    - Measures deck motor speed via carrier frequency tracking.
+    - Measures deck motor speed via carrier frequency tracking and time-corrects normalized tape time.
     """
 
     def __init__(self, sample_rate: float):
@@ -204,6 +205,7 @@ class BaudAgnosticPulseRecognizer:
         self.schmitt_state = 0
         self.last_transition_time = 0.0
         self.current_time = 0.0
+        self.tape_time = 0.0  # Time-Base Corrected normalized tape time
         self.prev_y = 0.0
 
         self.pos_half_dur = 0.0
@@ -215,6 +217,7 @@ class BaudAgnosticPulseRecognizer:
 
     def process_sample(self, s: float) -> Optional[Tuple[str, float, int]]:
         self.current_time += self.dt
+        self.tape_time += self.dt * self.speed_factor
 
         # 1. DC Blocker
         dc_y = s - self.dc_x1 + 0.995 * self.dc_y1
@@ -334,8 +337,8 @@ class BaudAgnosticPulseRecognizer:
 
 
 class PulseToByteAcceptor:
-    """
-    Converts incoming Mark/Space pulses into serial UART bytes for 1200 or 600 baud.
+    """Converts incoming Mark/Space pulses into serial UART bytes for 1200 or 600 baud.
+
     600 baud is strictly pulse-doubled 1200 baud:
     - 1200 baud: 1 bit = 2 pulse units (Mark = 2 Mark cycles; Space = 1 Space cycle).
     -  600 baud: 1 bit = 4 pulse units (Mark = 4 Mark cycles; Space = 2 Space cycles).
@@ -346,11 +349,12 @@ class PulseToByteAcceptor:
         self.baud = float(baud)
         self.bit_duration = 1.0 / self.baud
         self.confidence_threshold = float(confidence_threshold)
+        self.speed_factor = 1.0
         self.reset()
 
     def update_speed(self, speed_factor: float):
-        clamped_speed = max(0.85, min(1.18, speed_factor))
-        self.baud = self.nominal_baud * clamped_speed
+        self.speed_factor = max(0.85, min(1.18, speed_factor))
+        self.baud = self.nominal_baud * self.speed_factor
         self.bit_duration = 1.0 / self.baud
 
     def reset(self, in_block: bool = False, in_session: bool = False):
@@ -443,14 +447,17 @@ class PulseToByteAcceptor:
                         self.accum_time = 0.0
                     self.mark_time = 0.0
                     self.space_time = 0.0
+                    # Start bit rewind under time-base corrected clock
+                    nominal_bit_dur_tape = 1.0 / self.nominal_baud
+                    filter_delay_tape = 5.5 / 44100.0 * self.speed_factor
                     self.start_tick = max(
                         0,
                         int(
                             round(
                                 (
                                     (cur_tick / 4800.0)
-                                    - self.bit_duration
-                                    - (5.5 / 44100.0)
+                                    - nominal_bit_dur_tape
+                                    - filter_delay_tape
                                 )
                                 * 4800.0
                             )
@@ -500,7 +507,12 @@ class PulseToByteAcceptor:
 
                 if tot > 0 and (self.mark_time / tot) >= 0.60:
                     if byte_conf >= self.confidence_threshold and low_conf_bits <= 2:
-                        result = (self.current_byte, self.start_tick, "OK", byte_conf)
+                        result = (
+                            self.current_byte,
+                            self.start_tick,
+                            "OK",
+                            byte_conf,
+                        )
                     else:
                         result = (
                             self.current_byte,
@@ -533,6 +545,7 @@ class PulseToByteAcceptor:
 
 
 class T88StreamWriter:
+
     def __init__(self, out_stream: BinaryIO):
         self.out = out_stream
         self.header_written = False
@@ -641,6 +654,8 @@ def process_stream(
     state_start_tick = 0
     mark_counter = 0
     space_counter = 0
+    mark_first_tick = 0
+    space_first_tick = 0
     last_mark_tick = 0
     last_space_tick = 0
     data_buffer: List[int] = []
@@ -668,7 +683,8 @@ def process_stream(
 
         for s in samples:
             ev_cycle = demod.process_sample(s)
-            cur_tick = int(round(demod.current_time * 4800.0))
+            # Time-Base Corrected normalized tape container tick
+            cur_tick = int(round(demod.tape_time * 4800.0))
 
             if ev_cycle:
                 sym, dur_sec, sample_idx = ev_cycle
@@ -760,10 +776,17 @@ def process_stream(
                         and is_silence_gap
                         and not is_carrier_returned
                     )
+                    ticks_per_byte = int(
+                        round(11.0 * 4800.0 / active_acceptor.nominal_baud)
+                    )
+                    data_end_tick = data_start_tick + len(data_buffer) * ticks_per_byte
+
                     if data_buffer and not is_noise_fragment:
                         raw_data = bytes(data_buffer)
                         writer.write_data(
-                            data_start_tick, active_acceptor.nominal_baud, raw_data
+                            data_start_tick,
+                            active_acceptor.nominal_baud,
+                            raw_data,
                         )
                         if not quiet:
                             dev_pct = (demod.speed_factor - 1.0) * 100.0
@@ -789,7 +812,8 @@ def process_stream(
 
                     data_buffer = []
                     block_confidences = []
-                    state_start_tick = cur_tick
+                    # Post-DATA fix: rewind start tick of next carrier/blank to exact data completion tick
+                    state_start_tick = data_end_tick
                     state = "MARK" if is_carrier_returned else "BLANK"
                     if is_carrier_returned:
                         last_mark_tick = cur_tick
@@ -813,23 +837,31 @@ def process_stream(
 
             elif state == "BLANK":
                 if ev_cycle and ev_cycle[0] == "M":
+                    cycle_ticks = int(round(ev_cycle[1] * demod.speed_factor * 4800.0))
+                    if mark_counter == 0:
+                        mark_first_tick = max(state_start_tick, cur_tick - cycle_ticks)
                     mark_counter += 1
                     space_counter = 0
                     if mark_counter > 40:
-                        tag_len = cur_tick - state_start_tick
-                        writer.write_blank(state_start_tick, tag_len)
+                        tag_len = mark_first_tick - state_start_tick
+                        if tag_len > 0:
+                            writer.write_blank(state_start_tick, tag_len)
                         state = "MARK"
-                        state_start_tick = cur_tick
+                        state_start_tick = mark_first_tick
                         last_mark_tick = cur_tick
                         mark_counter = 0
                 elif ev_cycle and ev_cycle[0] == "S":
+                    cycle_ticks = int(round(ev_cycle[1] * demod.speed_factor * 4800.0))
+                    if space_counter == 0:
+                        space_first_tick = max(state_start_tick, cur_tick - cycle_ticks)
                     space_counter += 1
                     mark_counter = 0
                     if space_counter > 20:
-                        tag_len = cur_tick - state_start_tick
-                        writer.write_blank(state_start_tick, tag_len)
+                        tag_len = space_first_tick - state_start_tick
+                        if tag_len > 0:
+                            writer.write_blank(state_start_tick, tag_len)
                         state = "SPACE"
-                        state_start_tick = cur_tick
+                        state_start_tick = space_first_tick
                         last_space_tick = cur_tick
                         space_counter = 0
                 elif ev_cycle and ev_cycle[0] == "B":
@@ -841,12 +873,15 @@ def process_stream(
                     last_mark_tick = cur_tick
                     space_counter = 0
                 elif ev_cycle and ev_cycle[0] == "S":
+                    cycle_ticks = int(round(ev_cycle[1] * demod.speed_factor * 4800.0))
+                    if space_counter == 0:
+                        space_first_tick = cur_tick - cycle_ticks
                     space_counter += 1
                     if space_counter > 20:
-                        tag_len = last_mark_tick - state_start_tick
+                        tag_len = space_first_tick - state_start_tick
                         if tag_len > 0:
                             writer.write_mark(state_start_tick, tag_len)
-                            state_start_tick = last_mark_tick
+                            state_start_tick = space_first_tick
                         state = "SPACE"
                         last_space_tick = cur_tick
                         space_counter = 0
@@ -867,12 +902,15 @@ def process_stream(
                     last_space_tick = cur_tick
                     mark_counter = 0
                 elif ev_cycle and ev_cycle[0] == "M":
+                    cycle_ticks = int(round(ev_cycle[1] * demod.speed_factor * 4800.0))
+                    if mark_counter == 0:
+                        mark_first_tick = cur_tick - cycle_ticks
                     mark_counter += 1
                     if mark_counter > 40:
-                        tag_len = last_space_tick - state_start_tick
+                        tag_len = mark_first_tick - state_start_tick
                         if tag_len > 0:
                             writer.write_space(state_start_tick, tag_len)
-                            state_start_tick = last_space_tick
+                            state_start_tick = mark_first_tick
                         state = "MARK"
                         last_mark_tick = cur_tick
                         mark_counter = 0
@@ -895,7 +933,7 @@ def process_stream(
                     f"Progress: {format_time(cur_tick)} (State: {state}, Total: {total_bytes_decoded} bytes in {block_index} blocks)"
                 )
 
-    cur_tick = int(round(demod.current_time * 4800.0))
+    cur_tick = int(round(demod.tape_time * 4800.0))
     if state == "DATA" and data_buffer and active_acceptor is not None:
         raw_data = bytes(data_buffer)
         writer.write_data(data_start_tick, active_acceptor.nominal_baud, raw_data)
@@ -1146,7 +1184,10 @@ def run_test_suite() -> bool:
         {
             "name": "Pure Sinusoidal (Normal Polarity, 1200 Baud)",
             "blocks": [
-                (b"\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3SINE_1200_BASIC_TEST", 1200)
+                (
+                    b"\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3SINE_1200_BASIC_TEST",
+                    1200,
+                )
             ],
             "wave": "sine",
             "snr": None,
@@ -1160,7 +1201,10 @@ def run_test_suite() -> bool:
         {
             "name": "Pure Sinusoidal (Inverted Polarity 180 deg, 600 Baud)",
             "blocks": [
-                (b"\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3INVERTED_600_TEST", 600)
+                (
+                    b"\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3INVERTED_600_TEST",
+                    600,
+                )
             ],
             "wave": "sine",
             "snr": None,
@@ -1174,7 +1218,10 @@ def run_test_suite() -> bool:
         {
             "name": "Tape Saturation Curve (tanh + 2nd Harmonic + Asymmetry)",
             "blocks": [
-                (b"\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3TAPE_DISTORTION_1200", 1200)
+                (
+                    b"\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3TAPE_DISTORTION_1200",
+                    1200,
+                )
             ],
             "wave": "tape",
             "snr": None,
@@ -1188,7 +1235,10 @@ def run_test_suite() -> bool:
         {
             "name": "Hard Overdriven Square Wave (Saturated Line-In)",
             "blocks": [
-                (b"\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3SQUARE_OVERDRIVE_600", 600)
+                (
+                    b"\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3SQUARE_OVERDRIVE_600",
+                    600,
+                )
             ],
             "wave": "square",
             "snr": None,
@@ -1202,7 +1252,10 @@ def run_test_suite() -> bool:
         {
             "name": "Aging Tape Seeded-PRNG Noise (20 dB SNR Hiss & Rumble)",
             "blocks": [
-                (b"\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3NOISE_20DB_TEST", 1200)
+                (
+                    b"\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3NOISE_20DB_TEST",
+                    1200,
+                )
             ],
             "wave": "tape",
             "snr": 20.0,
@@ -1216,7 +1269,10 @@ def run_test_suite() -> bool:
         {
             "name": "Heavy Degradation Seeded-PRNG Noise (14 dB SNR)",
             "blocks": [
-                (b"\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3HEAVY_NOISE_14DB_600", 600)
+                (
+                    b"\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3HEAVY_NOISE_14DB_600",
+                    600,
+                )
             ],
             "wave": "tape",
             "snr": 14.0,
@@ -1230,7 +1286,10 @@ def run_test_suite() -> bool:
         {
             "name": "Tape Motor Speed Error (+4.5% Fast Playback Drift)",
             "blocks": [
-                (b"\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3FAST_SPEED_4.5_PCT", 1200)
+                (
+                    b"\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3FAST_SPEED_4.5_PCT",
+                    1200,
+                )
             ],
             "wave": "tape",
             "snr": 25.0,
@@ -1261,9 +1320,18 @@ def run_test_suite() -> bool:
         {
             "name": "9-Byte File Headers & Binary 0x00/0xFF Blocks (Multi-Part Tape)",
             "blocks": [
-                (b"\x00TEST1 \x00\x00", 1200),  # 9-byte header block starting with 0x00
-                (b"\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3SEC1_DATA_BLOCK", 1200),
-                (b"\x00TEST2 \x00\x00", 600),  # 9-byte header block at 600 baud
+                (
+                    b"\x00TEST1 \x00\x00",
+                    1200,
+                ),  # 9-byte header block starting with 0x00
+                (
+                    b"\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3\xd3SEC1_DATA_BLOCK",
+                    1200,
+                ),
+                (
+                    b"\x00TEST2 \x00\x00",
+                    600,
+                ),  # 9-byte header block at 600 baud
                 (b"\x00\x00\x00\x00\xff\xff\xff\xffBINARY_00_FF_TEST", 600),
             ],
             "wave": "tape",
@@ -1620,7 +1688,10 @@ def main():
         description="Stream PC-8001 / PC-8801 WAV audio to standard .t88 tape image."
     )
     parser.add_argument(
-        "input", nargs="?", default=None, help="Input WAV file or '-' for stdin / pipe"
+        "input",
+        nargs="?",
+        default=None,
+        help="Input WAV file or '-' for stdin / pipe",
     )
     parser.add_argument(
         "output",
