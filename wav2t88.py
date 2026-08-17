@@ -200,6 +200,7 @@ class BaudAgnosticPulseRecognizer:
 
         self.envelope = 0.0
         self.noise_floor = 0.0001
+        self.peak_carrier = 0.001
         self.schmitt_state = 0
         self.last_transition_time = 0.0
         self.current_time = 0.0
@@ -239,6 +240,11 @@ class BaudAgnosticPulseRecognizer:
             self.envelope = 0.75 * self.envelope + 0.25 * abs_y
         else:
             self.envelope = 0.998 * self.envelope + 0.002 * abs_y
+
+        if self.envelope > self.peak_carrier:
+            self.peak_carrier = 0.9 * self.peak_carrier + 0.1 * self.envelope
+        else:
+            self.peak_carrier = 0.9999 * self.peak_carrier + 0.0001 * self.envelope
 
         if abs_y < self.noise_floor:
             self.noise_floor = 0.99 * self.noise_floor + 0.01 * abs_y
@@ -281,7 +287,13 @@ class BaudAgnosticPulseRecognizer:
                     nominal_mark_period = 1.0 / self.measured_f_mark
                     boundary_period = nominal_mark_period * 1.414
 
-                    if full_cycle_sec < boundary_period:
+                    # Squelch check: if signal dropped below 22% of active carrier peak
+                    if self.envelope < max(
+                        self.peak_carrier * 0.22, self.noise_floor * 2.0, 0.0005
+                    ):
+                        sym = "B"
+                        self.mark_dur_hist.clear()
+                    elif full_cycle_sec < boundary_period:
                         sym = "M"  # 2400 Hz Mark
                         self.mark_dur_hist.append(full_cycle_sec)
                         if len(self.mark_dur_hist) > 80:
@@ -388,12 +400,6 @@ class PulseToByteAcceptor:
             if sym == "M":
                 self.space_time = 0.0
                 self.accum_time = 0.0
-                # Leader tone threshold:
-                # - Mid-block (between UART bytes): near-instant re-sync (~90% of a bit).
-                # - Within an active session (e.g. the short carrier between a header
-                #   and its data block, ~60-80ms total): a short ~20ms leader suffices.
-                # - Starting fresh from extended silence / BLANK: require a longer
-                #   ~40ms leader so brief motor/relay click transients can't trigger it.
                 min_mark = (
                     (self.bit_duration * 0.90)
                     if self.in_block
@@ -437,7 +443,19 @@ class PulseToByteAcceptor:
                         self.accum_time = 0.0
                     self.mark_time = 0.0
                     self.space_time = 0.0
-                    self.start_tick = cur_tick
+                    self.start_tick = max(
+                        0,
+                        int(
+                            round(
+                                (
+                                    (cur_tick / 4800.0)
+                                    - self.bit_duration
+                                    - (5.5 / 44100.0)
+                                )
+                                * 4800.0
+                            )
+                        ),
+                    )
                     self.last_activity_tick = cur_tick
                     self.consecutive_mark_time = 0.0
                     self.leader_validated = False
@@ -480,7 +498,6 @@ class PulseToByteAcceptor:
                 )
                 low_conf_bits = sum(1 for c in self.bit_confidences if c < 0.55)
 
-                # UART Stop bits verification (predominantly Mark carrier)
                 if tot > 0 and (self.mark_time / tot) >= 0.60:
                     if byte_conf >= self.confidence_threshold and low_conf_bits <= 2:
                         result = (self.current_byte, self.start_tick, "OK", byte_conf)
@@ -596,9 +613,6 @@ def process_stream(
     reader = StreamingWavReader(in_stream, channel_mode=channel_mode)
     fs = reader.sample_rate
 
-    # Autodetect search order: always evaluate 600 baud before 1200 baud, so that
-    # 1200 baud never wins a false "autodetect competition" race against a slower
-    # 600 baud data block (see Issue 1).
     candidate_order = (
         tuple(sorted(supported_bauds)) if len(supported_bauds) > 1 else supported_bauds
     )
@@ -626,16 +640,15 @@ def process_stream(
     state = "BLANK"
     state_start_tick = 0
     mark_counter = 0
+    space_counter = 0
     last_mark_tick = 0
+    last_space_tick = 0
     data_buffer: List[int] = []
     block_confidences: List[float] = []
     data_start_tick = 0
     total_bytes_decoded = 0
     block_index = 0
 
-    # Once a baud rate is locked for a file/session, it stays locked across
-    # subsequent data blocks (header -> data, data -> data, ...) as long as
-    # continuous carrier is present, and is only cleared on true silence (Issue 1).
     session_locked_baud: Optional[int] = None
     candidate_buffers = {b: [] for b in candidate_order}
 
@@ -664,10 +677,6 @@ def process_stream(
                     acc.update_speed(demod.speed_factor)
 
                 if active_acceptor is None:
-                    # If a baud is already locked for this session, only try that
-                    # one acceptor -- this is what stops a locked 600 baud data
-                    # block from ever losing a race to the faster 1200 baud
-                    # acceptor (Issue 1).
                     active_candidates = (
                         (session_locked_baud,)
                         if session_locked_baud is not None
@@ -697,6 +706,7 @@ def process_stream(
                     if confirmed_acc is not None:
                         active_acceptor = confirmed_acc
                         active_acceptor.in_block = True
+                        active_acceptor.leader_validated = True
                         chosen_baud = active_acceptor.nominal_baud
                         session_locked_baud = chosen_baud
                         byte_val, byte_tick_start, byte_conf = candidate_buffers[
@@ -735,7 +745,6 @@ def process_stream(
                                     f"{confidence_threshold * 100:.1f}%) at {format_time(ev[1])}"
                                 )
 
-            # Check block completion on steady Mark carrier (>24 bit times) or Silence (>0.15s)
             if active_acceptor is not None:
                 is_carrier_returned = active_acceptor.carrier_mark_time >= (
                     active_acceptor.bit_duration * 24.0
@@ -745,12 +754,6 @@ def process_stream(
                 )
 
                 if is_carrier_returned or is_silence_gap:
-                    # Isolated noise fragments (e.g. a motor/relay turn-on click)
-                    # that never accumulate a real leader still occasionally slip
-                    # a byte or two through; reject them ONLY when they terminate
-                    # abruptly into true silence with no trailing carrier at all
-                    # (Issue 2). A short block that ends via genuine carrier
-                    # (however few bytes it has) is real data and must be kept.
                     is_noise_fragment = (
                         data_buffer
                         and len(data_buffer) < 4
@@ -788,22 +791,11 @@ def process_stream(
                     block_confidences = []
                     state_start_tick = cur_tick
                     state = "MARK" if is_carrier_returned else "BLANK"
+                    if is_carrier_returned:
+                        last_mark_tick = cur_tick
                     if is_silence_gap:
-                        # True silence / erased gap: baud lock and mark tracking
-                        # both fully expire, re-enabling autodetection.
                         session_locked_baud = None
 
-                    # Preserve the session lock's leader validation across a
-                    # carrier-returned block boundary. The block-end detector
-                    # above already required >= 24 bit-times of unbroken Mark
-                    # carrier to fire; that easily covers the ~20ms in-session
-                    # leader requirement, so re-arming the SAME acceptor's leader
-                    # from a hard zero here would consume that budget a second
-                    # time. On real tapes the header->data gap is only ~60-80ms
-                    # total, so double-charging it against both the block-end and
-                    # leader thresholds silently drops the very next block
-                    # (Issue 3). Marking the leader pre-validated here uses that
-                    # already-observed carrier instead of re-measuring it.
                     reuse_leader = (
                         is_carrier_returned
                         and not is_silence_gap
@@ -822,6 +814,7 @@ def process_stream(
             elif state == "BLANK":
                 if ev_cycle and ev_cycle[0] == "M":
                     mark_counter += 1
+                    space_counter = 0
                     if mark_counter > 40:
                         tag_len = cur_tick - state_start_tick
                         writer.write_blank(state_start_tick, tag_len)
@@ -829,15 +822,35 @@ def process_stream(
                         state_start_tick = cur_tick
                         last_mark_tick = cur_tick
                         mark_counter = 0
-                elif ev_cycle and ev_cycle[0] != "M":
+                elif ev_cycle and ev_cycle[0] == "S":
+                    space_counter += 1
                     mark_counter = 0
+                    if space_counter > 20:
+                        tag_len = cur_tick - state_start_tick
+                        writer.write_blank(state_start_tick, tag_len)
+                        state = "SPACE"
+                        state_start_tick = cur_tick
+                        last_space_tick = cur_tick
+                        space_counter = 0
+                elif ev_cycle and ev_cycle[0] == "B":
+                    mark_counter = 0
+                    space_counter = 0
 
             elif state == "MARK":
                 if ev_cycle and ev_cycle[0] == "M":
                     last_mark_tick = cur_tick
-                # Continuous 2400 Hz Mark carrier absent for > 50ms: the carrier
-                # has genuinely ended into a silence/gap.
-                if (cur_tick - last_mark_tick) > int(4800 * 0.050):
+                    space_counter = 0
+                elif ev_cycle and ev_cycle[0] == "S":
+                    space_counter += 1
+                    if space_counter > 20:
+                        tag_len = last_mark_tick - state_start_tick
+                        if tag_len > 0:
+                            writer.write_mark(state_start_tick, tag_len)
+                            state_start_tick = last_mark_tick
+                        state = "SPACE"
+                        last_space_tick = cur_tick
+                        space_counter = 0
+                if (cur_tick - last_mark_tick) > int(4800 * 0.050) and state == "MARK":
                     tag_len = last_mark_tick - state_start_tick
                     if tag_len > 0:
                         writer.write_mark(state_start_tick, tag_len)
@@ -847,9 +860,33 @@ def process_stream(
                     for acc in acceptors.values():
                         acc.in_session = False
                     mark_counter = 0
+                    space_counter = 0
 
-        # Throttled progress: only report periodically if new bytes/blocks have
-        # actually been decoded since the last report (Issue 4).
+            elif state == "SPACE":
+                if ev_cycle and ev_cycle[0] == "S":
+                    last_space_tick = cur_tick
+                    mark_counter = 0
+                elif ev_cycle and ev_cycle[0] == "M":
+                    mark_counter += 1
+                    if mark_counter > 40:
+                        tag_len = last_space_tick - state_start_tick
+                        if tag_len > 0:
+                            writer.write_space(state_start_tick, tag_len)
+                            state_start_tick = last_space_tick
+                        state = "MARK"
+                        last_mark_tick = cur_tick
+                        mark_counter = 0
+                if (cur_tick - last_space_tick) > int(
+                    4800 * 0.050
+                ) and state == "SPACE":
+                    tag_len = last_space_tick - state_start_tick
+                    if tag_len > 0:
+                        writer.write_space(state_start_tick, tag_len)
+                        state_start_tick = last_space_tick
+                    state = "BLANK"
+                    mark_counter = 0
+                    space_counter = 0
+
         if not quiet and (cur_tick - last_progress_tick) >= (4800 * 10):
             last_progress_tick = cur_tick
             if total_bytes_decoded > last_reported_bytes:
@@ -893,19 +930,24 @@ def process_stream(
 # ============================================================================
 
 
-def run_inspector(in_stream: BinaryIO, channel_mode: str = "auto"):
+def run_inspector(
+    in_stream: BinaryIO, channel_mode: str = "auto", out_stream=sys.stdout
+):
     reader = StreamingWavReader(in_stream, channel_mode=channel_mode)
     fs = reader.sample_rate
     demod = BaudAgnosticPulseRecognizer(fs)
 
-    log_diag("======================================================================")
-    log_diag("               PC-8001 / PC-8801 TAPE AUDIO INSPECTOR                 ")
-    log_diag("======================================================================")
-    log_diag(
+    def print_out(msg: str):
+        print(msg, file=out_stream)
+
+    print_out("======================================================================")
+    print_out("               PC-8001 / PC-8801 TAPE AUDIO INSPECTOR                 ")
+    print_out("======================================================================")
+    print_out(
         f"Source Format : {reader.sample_rate} Hz, {reader.bits_per_sample}-bit, {reader.channels} channel(s)"
     )
-    log_diag(f"Channel Mode  : {channel_mode.upper()}")
-    log_diag("Scanning tape audio signal...")
+    print_out(f"Channel Mode  : {channel_mode.upper()}")
+    print_out("Scanning tape audio signal...")
 
     total_samples = 0
     mark_cycles = 0
@@ -930,33 +972,33 @@ def run_inspector(in_stream: BinaryIO, channel_mode: str = "auto"):
     m = int(dur_sec // 60)
     s = dur_sec % 60
 
-    log_diag("----------------------------------------------------------------------")
-    log_diag(f"Total Duration       : {m:02d}:{s:06.3f} ({total_samples} samples)")
+    print_out("----------------------------------------------------------------------")
+    print_out(f"Total Duration       : {m:02d}:{s:06.3f} ({total_samples} samples)")
     if reader.channels > 1:
-        log_diag(f"Left Channel Energy  : {reader.l_energy:.1f}")
-        log_diag(f"Right Channel Energy : {reader.r_energy:.1f}")
+        print_out(f"Left Channel Energy  : {reader.l_energy:.1f}")
+        print_out(f"Right Channel Energy : {reader.r_energy:.1f}")
         if reader.l_energy > reader.r_energy * 2.0:
-            log_diag(
+            print_out(
                 "Recommendation       : Data is predominantly on LEFT channel. Use '--channel left'."
             )
         elif reader.r_energy > reader.l_energy * 2.0:
-            log_diag(
+            print_out(
                 "Recommendation       : Data is predominantly on RIGHT channel. Use '--channel right'."
             )
 
-    log_diag(f"2400 Hz Mark Cycles  : {mark_cycles}")
-    log_diag(f"1200 Hz Space Cycles : {space_cycles}")
+    print_out(f"2400 Hz Mark Cycles  : {mark_cycles}")
+    print_out(f"1200 Hz Space Cycles : {space_cycles}")
 
     if speed_samples:
         avg_f_mark = sum(speed_samples) / len(speed_samples)
         speed_offset_pct = (avg_f_mark / 2400.0 - 1.0) * 100.0
-        log_diag(
+        print_out(
             f"Avg Carrier Freq     : {avg_f_mark:.1f} Hz (Deck Motor Speed: {speed_offset_pct:+.2f}%)"
         )
     else:
-        log_diag("Carrier Signal       : WARNING: No 2400 Hz Mark tone detected.")
+        print_out("Carrier Signal       : WARNING: No 2400 Hz Mark tone detected.")
 
-    log_diag("======================================================================")
+    print_out("======================================================================")
 
 
 # ============================================================================
@@ -1289,8 +1331,6 @@ def run_test_suite() -> bool:
     # ------------------------------------------------------------------
     # Timing-realistic scenarios: tight ~60-80ms header->data carrier gaps,
     # session baud locking across a file, and motor/relay click transients.
-    # These reproduce the specific real-tape conditions in Issues 1-3 that a
-    # uniform-gap synthetic WAV would not otherwise exercise.
     # ------------------------------------------------------------------
     def _gen_session_wav(
         segments,
@@ -1302,8 +1342,6 @@ def run_test_suite() -> bool:
         duty_asymmetry=0.02,
         prng_seed=98765,
     ):
-        # segments: list of ("data", bytes, baud, leader_sec, trailer_sec) or
-        # ("silence", duration_sec)
         rng = random.Random(prng_seed)
         sr = float(sample_rate)
         dt = 1.0 / sr
@@ -1357,6 +1395,8 @@ def run_test_suite() -> bool:
                 add_tone(2400.0, trailer_sec)
             elif seg[0] == "silence":
                 add_silence(seg[1])
+            elif seg[0] == "tone":
+                add_tone(seg[1], seg[2])
 
         if snr_db is not None:
             noise_amp = amplitude * (10.0 ** (-snr_db / 20.0))
@@ -1391,8 +1431,6 @@ def run_test_suite() -> bool:
 
     session_cases = []
 
-    # Issue 3: header + data separated by only a tight ~65ms continuous carrier
-    # gap (well within the real-world 60-80ms range), at both baud rates.
     for baud, gap_ms in ((600, 65.0), (1200, 65.0)):
         header = b"\x00SESHDR \x00"
         data = b"\xd3" * 10 + b"TIGHT_GAP_SESSION_LOCKED_PAYLOAD_" + bytes(range(64))
@@ -1414,10 +1452,6 @@ def run_test_suite() -> bool:
             )
         )
 
-    # Issue 1: multi-file tape with a baud change between files, each file
-    # having its own tight header->data gap; verifies the session lock tracks
-    # per-file baud correctly and true silence between files re-enables
-    # autodetection instead of leaking the previous file's locked baud.
     h_a = b"\x00FILE_A \x00"
     d_a = b"\xd3" * 10 + b"FIRST_FILE_1200_BAUD_DATA_BLOCK"
     h_b = b"\x00FILE_B \x00"
@@ -1441,8 +1475,6 @@ def run_test_suite() -> bool:
         )
     )
 
-    # Issue 2: brief (~15ms) motor/relay click transient during a long silence
-    # gap between two real blocks must not produce a spurious block.
     b1 = b"\xd3" * 10 + b"BLOCK_BEFORE_CLICK"
     b2 = b"\xd3" * 10 + b"BLOCK_AFTER_CLICK"
 
@@ -1527,6 +1559,30 @@ def run_test_suite() -> bool:
         )
     )
 
+    test_space_payload = b"\xd3" * 10 + b"SPACE_TAG_TEST"
+    space_segs = [
+        ("silence", 0.1),
+        ("tone", 1200.0, 0.3),
+        ("tone", 2400.0, 0.3),
+        ("data", test_space_payload, 1200, 0.05, 0.15),
+        ("tone", 1200.0, 0.3),
+        ("silence", 0.1),
+    ]
+    wav_space = _gen_session_wav(space_segs, snr_db=None)
+    out_space_t88 = io.BytesIO()
+    process_stream(wav_space, out_space_t88, quiet=True)
+    all_tags = parse_t88_stream(out_space_t88.getvalue())
+    space_tags = [t for t in all_tags if t[0] == 0x0102]
+    data_tags = [t for t in all_tags if t[0] == 0x0101]
+    space_test_ok = len(space_tags) >= 2 and len(data_tags) == 1
+    session_cases.append(
+        (
+            "Sustained 1200 Hz Space Tone Extracted as T88 0x0102 SPACE Tags",
+            space_test_ok,
+            [(1200, data_tags[0][1][12:])] if data_tags else [],
+        )
+    )
+
     for name, ok, decoded in session_cases:
         status_str = "PASS" if ok else "FAIL"
         if not ok:
@@ -1603,9 +1659,15 @@ def main():
         help="Minimum byte confidence threshold to accept UART bytes (default: 0.75)",
     )
     parser.add_argument(
+        "--quiet",
+        "-q",
+        action="store_true",
+        help="Suppress diagnostic logging to stderr.",
+    )
+    parser.add_argument(
         "--inspect",
         action="store_true",
-        help="Analyze tape audio capture and print diagnostic report to stderr.",
+        help="Analyze tape audio capture and print diagnostic report to stdout.",
     )
     parser.add_argument(
         "--test",
@@ -1634,7 +1696,7 @@ def main():
 
     if args.inspect:
         try:
-            run_inspector(in_stream, channel_mode=args.channel)
+            run_inspector(in_stream, channel_mode=args.channel, out_stream=sys.stdout)
         finally:
             if in_stream is not sys.stdin.buffer:
                 in_stream.close()
@@ -1656,6 +1718,7 @@ def main():
             supported_bauds=bauds,
             channel_mode=args.channel,
             confidence_threshold=args.confidence,
+            quiet=args.quiet,
         )
     except KeyboardInterrupt:
         log_diag("Streaming stopped by user.")

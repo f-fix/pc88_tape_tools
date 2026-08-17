@@ -363,7 +363,9 @@ class T88ToWavSynthesizer:
             self.current_time += self.dt
         return samples
 
-    def generate_tone(self, freq: float, duration_sec: float) -> List[float]:
+    def generate_tone(
+        self, freq: float, duration_sec: float, ramp_in: bool = False
+    ) -> List[float]:
         if duration_sec <= 0.0:
             return []
         samples = []
@@ -371,11 +373,24 @@ class T88ToWavSynthesizer:
         t_end = self.current_time + duration_sec
         t_start = self.current_time
         two_pi_f = 2.0 * math.pi * actual_freq
+        apply_ramp = ramp_in and self.mode in (
+            "tape",
+            "cassette",
+            "readback",
+            "shaped",
+            "pc",
+            "circuit",
+        )
+        ramp_dur = 0.0025  # 2.5 ms soft envelope onset
 
         while self.current_time < t_end:
             t_rel = self.current_time - t_start
             phase = two_pi_f * t_rel
-            samples.append(self.shape_sample(phase))
+            s = self.shape_sample(phase)
+            if apply_ramp and t_rel < ramp_dur:
+                envelope = 0.5 * (1.0 - math.cos(math.pi * (t_rel / ramp_dur)))
+                s *= envelope
+            samples.append(s)
             self.current_time += self.dt
         return samples
 
@@ -467,6 +482,7 @@ def convert_t88_to_wav(
     space_tag_count = 0
     gap_tag_count = 0
     last_progress_tick = 0
+    after_gap = True
 
     # Stream buffer for writing in uniform chunks
     sample_buffer: List[float] = []
@@ -488,17 +504,25 @@ def convert_t88_to_wav(
                     gap_ticks = st - current_tick
                     sample_buffer.extend(synth.generate_silence(gap_ticks / 4800.0))
                     current_tick = st
+                    after_gap = True
 
                 dur_sec = lt / 4800.0
                 if tag_id == T88Tag.GAP:
                     gap_tag_count += 1
                     sample_buffer.extend(synth.generate_silence(dur_sec))
+                    after_gap = True
                 elif tag_id == T88Tag.SPACE:
                     space_tag_count += 1
-                    sample_buffer.extend(synth.generate_tone(1200.0, dur_sec))
+                    sample_buffer.extend(
+                        synth.generate_tone(1200.0, dur_sec, ramp_in=after_gap)
+                    )
+                    after_gap = False
                 elif tag_id == T88Tag.MARK:
                     mark_tag_count += 1
-                    sample_buffer.extend(synth.generate_tone(2400.0, dur_sec))
+                    sample_buffer.extend(
+                        synth.generate_tone(2400.0, dur_sec, ramp_in=after_gap)
+                    )
+                    after_gap = False
 
                 current_tick = st + lt
                 flush_samples()
@@ -512,6 +536,7 @@ def convert_t88_to_wav(
                     gap_ticks = st - current_tick
                     sample_buffer.extend(synth.generate_silence(gap_ticks / 4800.0))
                     current_tick = st
+                    after_gap = True
 
                 # Determine effective baud rate: PC-8001/PC-8801 strictly supports 1200 or 600 baud
                 if baud_override in (600, 1200):
@@ -535,6 +560,7 @@ def convert_t88_to_wav(
                 total_data_bytes += len(pdata)
                 data_block_count += 1
                 current_tick = st + lt
+                after_gap = False
 
                 if not quiet:
                     log_diag(
@@ -599,7 +625,8 @@ def run_inspector(in_stream: BinaryIO, out_stream=sys.stdout):
         "======================================================================",
         file=out_stream,
     )
-    print(f"Magic Signature: {reader.header_bytes.rstrip(b'\x00')!r}", file=out_stream)
+    NUL = b'\x00'
+    print(f"Magic Signature: {reader.header_bytes.rstrip(NUL)!r}", file=out_stream)
 
     total_ticks = 0
     total_data_bytes = 0
@@ -695,10 +722,9 @@ def run_test_suite() -> bool:
         "======================================================================\n\n"
     )
 
-    # We test against input_file_0 (wav2t88) and input_file_1 (pc88_tape_tools) if present
     try:
-        import input_file_0
-        import input_file_1
+        import wav2t88
+        import pc88_tape_tools
 
         has_tools = True
     except ImportError:
@@ -808,7 +834,7 @@ def run_test_suite() -> bool:
         ]
 
         for desc, payload_data, baud in test_payloads:
-            t88_obj = input_file_1.T88File.from_cmt_data(payload_data, baud=baud)
+            t88_obj = pc88_tape_tools.T88File.from_cmt_data(payload_data, baud=baud)
             t88_in_bytes = t88_obj.pack()
 
             for synth_mode in ("tape", "shaped", "ideal"):
@@ -823,15 +849,13 @@ def run_test_suite() -> bool:
                 )
                 wav_bytes = wav_out.getvalue()
 
-                # Demodulate WAV back to T88 with input_file_0
+                # Demodulate WAV back to T88 with wav2t88
                 t88_demod_out = io.BytesIO()
-                input_file_0.process_stream(
-                    io.BytesIO(wav_bytes), t88_demod_out, quiet=True
-                )
+                wav2t88.process_stream(io.BytesIO(wav_bytes), t88_demod_out, quiet=True)
                 demod_bytes = t88_demod_out.getvalue()
 
-                # Extract payload with input_file_1
-                demod_file = input_file_1.T88File.unpack(io.BytesIO(demod_bytes))
+                # Extract payload with pc88_tape_tools
+                demod_file = pc88_tape_tools.T88File.unpack(io.BytesIO(demod_bytes))
                 demod_payload = demod_file.extract_cmt_payload()
 
                 matched = demod_payload == payload_data
@@ -863,49 +887,41 @@ def run_test_suite() -> bool:
             )
 
             multi_blocks = [
-                input_file_1.T88Block(
-                    input_file_1.T88Tag.VERSION, struct.pack("<H", 0x0100)
+                pc88_tape_tools.T88Block(
+                    pc88_tape_tools.T88Tag.VERSION, struct.pack("<H", 0x0100)
                 ),
-                input_file_1.T88Block(
-                    input_file_1.T88Tag.MARK, struct.pack("<II", 0, 4800)
+                pc88_tape_tools.T88Block(
+                    pc88_tape_tools.T88Tag.MARK, struct.pack("<II", 0, 4800)
                 ),
-                input_file_1.T88Block(
-                    (
-                        input_file_1.T88Tag.DATA_1200
-                        if b_rate == 1200
-                        else input_file_1.T88Tag.DATA_300
-                    ),
+                pc88_tape_tools.T88Block(
+                    0x0101,
                     h1,
                 ),
-                input_file_1.T88Block(
-                    input_file_1.T88Tag.MARK,
+                pc88_tape_tools.T88Block(
+                    pc88_tape_tools.T88Tag.MARK,
                     struct.pack("<II", 4800 + len(hdr_bytes) * tpb, 320),
                 ),  # ~66ms carrier
-                input_file_1.T88Block(
-                    (
-                        input_file_1.T88Tag.DATA_1200
-                        if b_rate == 1200
-                        else input_file_1.T88Tag.DATA_300
-                    ),
+                pc88_tape_tools.T88Block(
+                    0x0101,
                     h2,
                 ),
-                input_file_1.T88Block(
-                    input_file_1.T88Tag.MARK,
+                pc88_tape_tools.T88Block(
+                    pc88_tape_tools.T88Tag.MARK,
                     struct.pack("<II", data_start + len(data_body) * tpb, 2400),
                 ),
-                input_file_1.T88Block(input_file_1.T88Tag.END, b""),
+                pc88_tape_tools.T88Block(pc88_tape_tools.T88Tag.END, b""),
             ]
-            multi_t88 = input_file_1.T88File(blocks=multi_blocks).pack()
+            multi_t88 = pc88_tape_tools.T88File(blocks=multi_blocks).pack()
 
             wav_multi = io.BytesIO()
             convert_t88_to_wav(
                 io.BytesIO(multi_t88), wav_multi, mode="tape", quiet=True
             )
             demod_multi = io.BytesIO()
-            input_file_0.process_stream(
+            wav2t88.process_stream(
                 io.BytesIO(wav_multi.getvalue()), demod_multi, quiet=True
             )
-            demod_multi_file = input_file_1.T88File.unpack(
+            demod_multi_file = pc88_tape_tools.T88File.unpack(
                 io.BytesIO(demod_multi.getvalue())
             )
             multi_matched = (
