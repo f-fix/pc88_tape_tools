@@ -19,26 +19,18 @@ Hardware & Signal Specifications:
   * 1200 baud: 44 ticks/byte (fmt 0x01CC).
   *  600 baud: 88 ticks/byte (fmt 0x00CC).
 
-Three Waveform Synthesis Modes:
+Waveform Synthesis Modes:
 1. 'tape' / 'cassette' (Default):
    Simulates magnetic tape saturation and cassette playback head induction.
    Uses a smooth tanh saturation curve with natural harmonic richness.
-   Ideal for playing into real retro computers, cassette tape recorders,
-   or software demodulators (e.g. wav2t88 / emulators).
-2. 'shaped' / 'pc':
+2. 'acoustic' / 'motor' / 'spinup':
+   Simulates mechanical cassette deck motor acceleration time constant (tau ~ 60-120 ms)
+   and relay closure delay at carrier onsets following tape stops/gaps.
+3. 'shaped' / 'pc':
    Simulates the analog output circuitry of the physical PC-8001 / PC-8801 hardware.
    Models the RC low-pass edge smoothing and AC-coupling capacitor droop/sag.
-3. 'ideal' / 'square':
+4. 'ideal' / 'square':
    Pure digital square wave directly from the PC 8255 / 8251 CMT OUT port.
-   Ideal for chaining into external physical DSP cassette channel modelers
-   (such as wav2cas / cassette_modeler.py).
-
-Streaming & Header Updating:
-- Streams sample blocks directly to the output without buffering the entire audio in RAM.
-- Emits standard WAV header with streaming placeholder sizes (0xFFFFFFFF) initially.
-- At completion, automatically updates the header with exact file/sample count if the
-  destination is seekable (file), or gracefully preserves the streaming header if
-  unseekable (stdout / pipe / FIFO).
 """
 
 import sys
@@ -55,18 +47,53 @@ sys.dont_write_bytecode = True
 
 
 # ============================================================================
-# T88 Tag Identifiers & Constants
+# Unified T88 Tag Identifiers & DataSubHeader Constants
 # ============================================================================
 
 
 class T88Tag:
     END: int = 0x0000  # Terminal block marker
     VERSION: int = 0x0001  # Version info (uint16)
+    COMMENT: int = 0x0010  # UTF-8 / ASCII annotation text
     GAP: int = 0x0100  # Blank / silence interval (start_tick, length_ticks)
     DATA: int = 0x0101  # Serial UART data block (start_tick, length_ticks, dlen, fmt)
+    DATA_1200: int = 0x0101  # Alias for standard 1200 baud DATA tag
+    DATA_300: int = 0x0101  # Alias for standard DATA tag
     SPACE: int = 0x0102  # 1200 Hz Space tone burst (start_tick, length_ticks)
     MARK: int = 0x0103  # 2400 Hz Mark carrier tone (start_tick, length_ticks)
-    COMMENT: int = 0x0010  # UTF-8 / ASCII annotation text
+
+
+class DataSubHeader:
+    """12-byte T88 DATA block sub-header (<IIHH)."""
+
+    STRUCT_FORMAT: str = "<IIHH"
+    SIZE: int = 12
+
+    def __init__(
+        self,
+        start_tick: int = 0,
+        length_ticks: int = 0,
+        data_len: int = 0,
+        fmt_code: int = 0x01CC,
+    ):
+        self.start_tick = int(start_tick)
+        self.length_ticks = int(length_ticks)
+        self.data_len = int(data_len)
+        self.fmt_code = int(fmt_code)
+
+    def pack(self) -> bytes:
+        return struct.pack(
+            self.STRUCT_FORMAT,
+            self.start_tick,
+            self.length_ticks,
+            self.data_len,
+            self.fmt_code,
+        )
+
+    @classmethod
+    def unpack(cls, data: bytes) -> "DataSubHeader":
+        st, lt, dlen, fmt = struct.unpack(cls.STRUCT_FORMAT, data[:12])
+        return cls(st, lt, dlen, fmt)
 
 
 T88_HEADER_MAGICS: Tuple[bytes, ...] = (
@@ -132,7 +159,6 @@ class StreamingT88Reader:
             tag_id, length = struct.unpack("<HH", tag_hdr)
             payload = self._read_exact(length) if length > 0 else b""
             if len(payload) < length:
-                # Truncated payload at EOF
                 break
 
             yield (tag_id, length, payload)
@@ -177,24 +203,22 @@ class StreamingWavWriter:
         self._write_initial_header()
 
     def _write_initial_header(self):
-        # 12 bytes RIFF header + 24 bytes fmt chunk + 8 bytes data header = 44 bytes
-        # Streaming placeholder sizes = 0xFFFFFFFF
         placeholder_size = 0xFFFFFFFF
         hdr = bytearray()
         hdr.extend(b"RIFF")
         hdr.extend(struct.pack("<I", placeholder_size))
         hdr.extend(b"WAVE")
         hdr.extend(b"fmt ")
-        hdr.extend(struct.pack("<I", 16))  # Subchunk1Size for PCM
+        hdr.extend(struct.pack("<I", 16))
         hdr.extend(
             struct.pack(
                 "<HHIIHH",
-                1,  # AudioFormat: 1 = PCM
-                self.channels,  # NumChannels
-                self.sample_rate,  # SampleRate
-                self.byte_rate,  # ByteRate
-                self.block_align,  # BlockAlign
-                self.bits_per_sample,  # BitsPerSample
+                1,
+                self.channels,
+                self.sample_rate,
+                self.byte_rate,
+                self.block_align,
+                self.bits_per_sample,
             )
         )
         hdr.extend(b"data")
@@ -205,18 +229,10 @@ class StreamingWavWriter:
         self.header_written = True
 
     def write_pcm_samples(self, mono_floats: List[float]):
-        """
-        Converts floating-point samples [-1.0, 1.0] to 16-bit PCM and streams out.
-        """
         if not mono_floats:
             return
 
         num_frames = len(mono_floats)
-        # Quantize to 16-bit signed integer [-32768, 32767].
-        # Manual clamp (instead of calling the max()/min() builtins per-sample)
-        # and array.array (instead of struct.pack(*huge_arg_list)) are both
-        # pure speed optimizations; the rounding/clamping semantics are
-        # identical to the original implementation bit-for-bit.
         _round = round
         quantized = []
         qappend = quantized.append
@@ -228,8 +244,6 @@ class StreamingWavWriter:
                 v = -32768
             qappend(v)
 
-        # array.array uses native machine byte order, but WAV PCM data must be
-        # little-endian; byteswap on big-endian hosts to preserve correctness.
         def _to_le_bytes(int_list):
             arr = array.array("h", int_list)
             if sys.byteorder == "big":
@@ -265,10 +279,6 @@ class StreamingWavWriter:
         self.total_pcm_bytes_written += len(raw_bytes)
 
     def finalize(self) -> bool:
-        """
-        Attempts to update the WAV header with exact sizes if seekable.
-        Returns True if seek was successful, False if stream was unseekable (pipe).
-        """
         self.out.flush()
         is_seekable = False
         try:
@@ -285,20 +295,16 @@ class StreamingWavWriter:
 
         try:
             cur_pos = self.out.tell()
-            # Update RIFF size at byte offset 4: (total_pcm_bytes + 36)
             riff_size = self.total_pcm_bytes_written + 36
-            # Avoid 32-bit overflow if size exceeds 4 GB
             riff_size_field = min(0xFFFFFFFF, riff_size)
             data_size_field = min(0xFFFFFFFF, self.total_pcm_bytes_written)
 
             self.out.seek(4, os.SEEK_SET)
             self.out.write(struct.pack("<I", riff_size_field))
 
-            # Update data size at byte offset 40
             self.out.seek(40, os.SEEK_SET)
             self.out.write(struct.pack("<I", data_size_field))
 
-            # Seek back to original end position
             self.out.seek(cur_pos, os.SEEK_SET)
             self.out.flush()
             return True
@@ -307,7 +313,7 @@ class StreamingWavWriter:
 
 
 # ============================================================================
-# FSK & Waveform Synthesizer (Tape, Shaped PC, Ideal Square)
+# FSK & Waveform Synthesizer (Tape, Acoustic, Shaped PC, Ideal Square)
 # ============================================================================
 
 
@@ -335,8 +341,7 @@ class T88ToWavSynthesizer:
         self.current_time = 0.0
         self.current_tick = 0
 
-        # Shaped PC Analog Circuit Filter States:
-        # 1st-order RC lowpass filter (~6000 Hz) + AC coupling DC blocker (~150 Hz)
+        # Shaped PC Analog Circuit Filter States
         rc_cutoff_hz = 6000.0
         rc_w = 2.0 * math.pi * rc_cutoff_hz
         self.lp_alpha = (rc_w * self.dt) / (1.0 + rc_w * self.dt)
@@ -344,10 +349,10 @@ class T88ToWavSynthesizer:
         self.dc_x1 = 0.0
         self.dc_y1 = 0.0
 
-        # Normalize the mode alias group once (instead of re-checking tuple
-        # membership on every single sample inside the hot synthesis loops).
         if self.mode in ("ideal", "square", "direct"):
             self._kind = "ideal"
+        elif self.mode in ("acoustic", "motor", "spinup"):
+            self._kind = "acoustic"
         elif self.mode in ("tape", "cassette", "readback"):
             self._kind = "tape"
         elif self.mode in ("shaped", "pc", "circuit"):
@@ -356,20 +361,15 @@ class T88ToWavSynthesizer:
             self._kind = "raw"
 
     def shape_sample(self, phase: float) -> float:
-        """
-        Transforms instantaneous phase into an audio sample based on active mode.
-        """
         sin_val = math.sin(phase)
         base = 0.0
 
-        if self.mode in ("ideal", "square", "direct"):
+        if self._kind == "ideal":
             base = 1.0 if sin_val >= 0.0 else -1.0
-        elif self.mode in ("tape", "cassette", "readback"):
-            # Tape saturation: tanh soft-clipping + 2nd harmonic magnetic asymmetry
+        elif self._kind in ("tape", "acoustic"):
             s = sin_val + 0.15 * math.sin(2.0 * phase)
             base = math.tanh(s * 1.8)
-        elif self.mode in ("shaped", "pc", "circuit"):
-            # PC analog stage: digital square -> RC lowpass edge smoothing -> AC highpass tilt
+        elif self._kind == "shaped":
             raw = 1.0 if sin_val >= 0.0 else -1.0
             self.rc_lp += self.lp_alpha * (raw - self.rc_lp)
             hp_y = self.rc_lp - self.dc_x1 + 0.995 * self.dc_y1
@@ -397,21 +397,6 @@ class T88ToWavSynthesizer:
     def _gen_wave(
         self, two_pi_f: float, duration_sec: float, apply_ramp: bool
     ) -> List[float]:
-        """
-        Shared sample-generation core used by generate_tone() and
-        generate_uart_data(). This performs exactly the same arithmetic, in
-        exactly the same order, as calling shape_sample() once per sample in
-        a Python for-loop -- it is just written as one specialized tight
-        loop per waveform kind so that:
-          * self.<attr> lookups become local variables,
-          * math.sin/tanh/cos become local references,
-          * the mode dispatch (originally re-checked on every sample inside
-            shape_sample) happens once per call instead of once per sample,
-          * shape_sample()'s per-sample Python function-call overhead is
-            removed entirely.
-        None of this changes the floating point operation order, so output
-        is bit-for-bit identical to the original implementation.
-        """
         if duration_sec <= 0.0:
             return []
         samples = []
@@ -420,7 +405,7 @@ class T88ToWavSynthesizer:
         amplitude = self.amplitude
         invert = self.invert
         kind = self._kind
-        ramp_dur = 0.0025  # 2.5 ms soft envelope onset
+        ramp_dur = 0.0025
 
         t = self.current_time
         t_start = t
@@ -428,7 +413,41 @@ class T88ToWavSynthesizer:
 
         _sin = math.sin
 
-        if kind == "tape":
+        if kind == "acoustic":
+            _tanh = math.tanh
+            _cos = math.cos
+            _exp = math.exp
+            pi = math.pi
+            tau = 0.080  # 80ms motor spin-up time constant
+            t_relay = 0.020  # 20ms relay contact closure delay
+            spinup_dur = 0.140
+
+            while t < t_end:
+                t_rel = t - t_start
+                if apply_ramp and t_rel < spinup_dur:
+                    if t_rel < t_relay:
+                        out = 0.0
+                    else:
+                        speed_mult = 1.0 - _exp(-(t_rel - t_relay) / tau)
+                        phase = two_pi_f * (t_rel - t_relay) * speed_mult
+                        sin_val = _sin(phase)
+                        base = _tanh((sin_val + 0.15 * _sin(2.0 * phase)) * 1.8)
+                        ramp_factor = min(
+                            1.0, (t_rel - t_relay) / (spinup_dur - t_relay)
+                        )
+                        out = base * amplitude * ramp_factor
+                else:
+                    phase = two_pi_f * t_rel
+                    sin_val = _sin(phase)
+                    base = _tanh((sin_val + 0.15 * _sin(2.0 * phase)) * 1.8)
+                    out = base * amplitude
+
+                if invert:
+                    out = -out
+                append(out)
+                t += dt
+
+        elif kind == "tape":
             _tanh = math.tanh
             _cos = math.cos
             pi = math.pi
@@ -471,8 +490,6 @@ class T88ToWavSynthesizer:
             self.dc_x1 = dc_x1
             self.dc_y1 = dc_y1
         elif kind == "ideal":
-            # apply_ramp is always False for "ideal" (see generate_tone),
-            # matching the original mode-membership check.
             while t < t_end:
                 t_rel = t - t_start
                 phase = two_pi_f * t_rel
@@ -503,7 +520,7 @@ class T88ToWavSynthesizer:
             return []
         actual_freq = freq * self.speed
         two_pi_f = 2.0 * math.pi * actual_freq
-        apply_ramp = ramp_in and self._kind in ("tape", "shaped")
+        apply_ramp = ramp_in and self._kind in ("tape", "shaped", "acoustic")
         return self._gen_wave(two_pi_f, duration_sec, apply_ramp)
 
     def generate_uart_data(self, data_bytes: bytes, baud: int) -> List[float]:
@@ -518,7 +535,6 @@ class T88ToWavSynthesizer:
         two_pi_space = 2.0 * math.pi * f_space
 
         for b in data_bytes:
-            # 1 Start bit (0 / Space), 8 Data bits (LSB-first), 2 Stop bits (1 / Mark)
             bits = [0] + [(b >> i) & 1 for i in range(8)] + [1, 1]
             for bit in bits:
                 two_pi_f = two_pi_mark if bit == 1 else two_pi_space
@@ -590,23 +606,9 @@ def convert_t88_to_wav(
     last_progress_tick = 0
     after_gap = True
 
-    # Stream buffer for writing in uniform chunks.
-    #
-    # NOTE: sample_buffer is *not* immediately shrunk from the front after
-    # every write. The original implementation did
-    # `sample_buffer = sample_buffer[num_to_write:]` on every iteration,
-    # which reallocates and copies the entire remaining tail every time --
-    # O(remaining) per chunk. Since a single T88 tag (e.g. a multi-second
-    # MARK/leader tone) can expand to hundreds of thousands of samples
-    # before flush_samples() is even called, that turned into O(n^2) work
-    # for long tones and was overwhelmingly the actual hot spot (confirmed
-    # via profiling -- not the per-sample synthesis math). Instead we track
-    # a read position (buf_pos) and only periodically compact the buffer,
-    # which keeps the same O(1)-amortized/bounded-memory streaming design
-    # the docstring promises without the quadratic blowup.
     sample_buffer: List[float] = []
     buf_pos = 0
-    COMPACT_THRESHOLD = 1 << 16  # 65536 samples
+    COMPACT_THRESHOLD = 1 << 16
 
     def flush_samples(force: bool = False):
         nonlocal sample_buffer, buf_pos
@@ -617,11 +619,9 @@ def convert_t88_to_wav(
             writer.write_pcm_samples(sample_buffer[buf_pos:end])
             buf_pos = end
         if buf_pos == n:
-            # Fully drained: O(1) reset instead of a slice/copy.
             sample_buffer = []
             buf_pos = 0
         elif buf_pos >= COMPACT_THRESHOLD:
-            # Infrequent compaction keeps memory bounded; amortized O(1).
             sample_buffer = sample_buffer[buf_pos:]
             buf_pos = 0
 
@@ -629,7 +629,6 @@ def convert_t88_to_wav(
         if tag_id in (T88Tag.GAP, T88Tag.SPACE, T88Tag.MARK):
             if len(payload) >= 8:
                 st, lt = struct.unpack("<II", payload[:8])
-                # Inter-block timeline synchronization
                 if st > current_tick:
                     gap_ticks = st - current_tick
                     sample_buffer.extend(synth.generate_silence(gap_ticks / 4800.0))
@@ -659,7 +658,13 @@ def convert_t88_to_wav(
 
         elif tag_id == T88Tag.DATA:
             if len(payload) >= 12:
-                st, lt, dlen, fmt = struct.unpack("<IIHH", payload[:12])
+                dsh = DataSubHeader.unpack(payload[:12])
+                st, lt, dlen, fmt = (
+                    dsh.start_tick,
+                    dsh.length_ticks,
+                    dsh.data_len,
+                    dsh.fmt_code,
+                )
                 pdata = payload[12 : 12 + dlen]
 
                 if st > current_tick:
@@ -668,7 +673,6 @@ def convert_t88_to_wav(
                     current_tick = st
                     after_gap = True
 
-                # Determine effective baud rate: PC-8001/PC-8801 strictly supports 1200 or 600 baud
                 if baud_override in (600, 1200):
                     eff_baud = baud_override
                 elif fmt == 0x00CC:
@@ -677,7 +681,6 @@ def convert_t88_to_wav(
                     eff_baud = 1200
                 elif dlen > 0 and lt > 0:
                     ticks_per_byte = lt / dlen
-                    # 88 ticks/byte = 600 baud, 44 ticks/byte = 1200 baud
                     eff_baud = (
                         600
                         if abs(ticks_per_byte - 88) < abs(ticks_per_byte - 44)
@@ -705,7 +708,6 @@ def convert_t88_to_wav(
                 comment_str = payload.decode("utf-8", errors="ignore").strip()
                 log_diag(f"Comment: {comment_str}")
 
-        # Throttled periodic progress
         if not quiet and (current_tick - last_progress_tick) >= (4800 * 15):
             last_progress_tick = current_tick
             log_diag(
@@ -713,10 +715,8 @@ def convert_t88_to_wav(
                 f"({total_data_bytes} bytes in {data_block_count} blocks synthesized)"
             )
 
-    # Flush any remaining audio samples
     flush_samples(force=True)
 
-    # Finalize WAV header (seek back and update chunk sizes if seekable)
     seek_ok = writer.finalize()
     dur_sec = writer.total_frames_written / sample_rate
     m = int(dur_sec // 60)
@@ -797,7 +797,13 @@ def run_inspector(in_stream: BinaryIO, out_stream=sys.stdout):
                 )
         elif tag_id == T88Tag.DATA:
             if len(payload) >= 12:
-                st, lt, dlen, fmt = struct.unpack("<IIHH", payload[:12])
+                dsh = DataSubHeader.unpack(payload[:12])
+                st, lt, dlen, fmt = (
+                    dsh.start_tick,
+                    dsh.length_ticks,
+                    dsh.data_len,
+                    dsh.fmt_code,
+                )
                 total_ticks = max(total_ticks, st + lt)
                 total_data_bytes += dlen
                 eff_baud = 600 if fmt == 0x00CC else 1200
@@ -967,7 +973,7 @@ def run_test_suite() -> bool:
             t88_obj = pc88_tape_tools.T88File.from_cmt_data(payload_data, baud=baud)
             t88_in_bytes = t88_obj.pack()
 
-            for synth_mode in ("tape", "shaped", "ideal"):
+            for synth_mode in ("tape", "shaped", "ideal", "acoustic"):
                 wav_out = io.BytesIO()
                 convert_t88_to_wav(
                     io.BytesIO(t88_in_bytes),
@@ -979,12 +985,10 @@ def run_test_suite() -> bool:
                 )
                 wav_bytes = wav_out.getvalue()
 
-                # Demodulate WAV back to T88 with wav2t88
                 t88_demod_out = io.BytesIO()
                 wav2t88.process_stream(io.BytesIO(wav_bytes), t88_demod_out, quiet=True)
                 demod_bytes = t88_demod_out.getvalue()
 
-                # Extract payload with pc88_tape_tools
                 demod_file = pc88_tape_tools.T88File.unpack(io.BytesIO(demod_bytes))
                 demod_payload = demod_file.extract_cmt_payload()
 
@@ -1030,7 +1034,7 @@ def run_test_suite() -> bool:
                 pc88_tape_tools.T88Block(
                     pc88_tape_tools.T88Tag.MARK,
                     struct.pack("<II", 4800 + len(hdr_bytes) * tpb, 320),
-                ),  # ~66ms carrier
+                ),
                 pc88_tape_tools.T88Block(
                     0x0101,
                     h2,
@@ -1087,29 +1091,14 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Waveform Modes:
-  tape    : (Default) Simulates magnetic tape saturation & playback head response.
-  shaped  : Simulates PC-8001 / PC-8801 analog RC output buffer stage & AC droop.
-  ideal   : Pure mathematical square wave from the PC 8255 / 8251 CMT OUT port.
+  tape     : (Default) Simulates magnetic tape saturation & playback head response.
+  acoustic : Simulates motor spin-up time constant (tau ~ 80ms) and relay delay.
+  shaped   : Simulates PC-8001 / PC-8801 analog RC output buffer stage & AC droop.
+  ideal    : Pure mathematical square wave from the PC 8255 / 8251 CMT OUT port.
 
 Baud Rates:
   PC-8001 / PC-8801 hardware and .t88 format standardly support 1200 baud and
   600 baud (pulse-doubled 1200 baud).
-
-Examples:
-  # Stream file to file in default tape saturation mode:
-  t882wav.py game.t88 game.wav
-
-  # Stream from stdin to stdout via pipe:
-  cat game.t88 | t882wav.py - - > game.wav
-
-  # Generate shaped PC circuit output at 48 kHz:
-  t882wav.py game.t88 game.wav --mode shaped --sample-rate 48000
-
-  # Inspect T88 timing & contents to stdout:
-  t882wav.py game.t88 --inspect > report.txt
-
-  # Chain into external physical DSP cassette channel modeler (wav2cas):
-  t882wav.py game.t88 - --mode ideal | python3 cassette_modeler.py - game_tape.wav
 """,
     )
     parser.add_argument(
@@ -1127,8 +1116,18 @@ Examples:
         "--wave",
         type=str,
         default="tape",
-        choices=["tape", "cassette", "shaped", "pc", "ideal", "square"],
-        help="Waveform synthesis mode: 'tape' (default), 'shaped' (PC circuit), 'ideal' (square)",
+        choices=[
+            "tape",
+            "cassette",
+            "acoustic",
+            "motor",
+            "spinup",
+            "shaped",
+            "pc",
+            "ideal",
+            "square",
+        ],
+        help="Waveform synthesis mode: 'tape' (default), 'acoustic' (motor spinup), 'shaped' (PC circuit), 'ideal' (square)",
     )
     parser.add_argument(
         "--sample-rate",
