@@ -17,6 +17,13 @@ Hardware & Format Specifications:
   *  600 baud: 1 Mark bit = 4 cycles of 2400 Hz; 1 Space bit = 2 cycles of 1200 Hz.
 - Frame Format: 1 Start bit (0), 8 Data bits (LSB-first), 2 Stop bits (1).
 - T88 Format Codes: 0x01CC for 1200 baud (44 ticks/byte), 0x00CC for 600 baud (88 ticks/byte).
+
+Timing Flavors:
+- verbatim: Raw wall-clock playback timeline (N_samples / F_s, no virtual ticks).
+- reconstructed (Default): Phase-unpacked cycle counts (1M = 2 ticks, 1S = 4 ticks, no fake pulses).
+- kinematic-infilled: Ballistic curve extrapolation infilling relay-void deficit (~10-25 ms).
+- rom-authentic: Aligned to exact Z80 BIOS delay-loop target constants (12000 / 2400).
+- canonical: DLE mastering templates (12000 / 2400, initial 480+480 GAP, 32000B DATA chunks).
 """
 
 import argparse
@@ -27,6 +34,56 @@ import random
 import struct
 import sys
 from typing import BinaryIO, List, Optional, Tuple
+
+
+# ============================================================================
+# Unified T88 Tag Identifiers & DataSubHeader Constants
+# ============================================================================
+
+
+class T88Tag:
+    END: int = 0x0000  # Terminal block marker
+    VERSION: int = 0x0001  # Version info (uint16)
+    COMMENT: int = 0x0010  # UTF-8 / ASCII annotation text
+    GAP: int = 0x0100  # Blank / silence interval (start_tick, length_ticks)
+    DATA: int = 0x0101  # Serial UART data block (start_tick, length_ticks, dlen, fmt)
+    DATA_1200: int = 0x0101  # Alias for standard 1200 baud DATA tag
+    DATA_300: int = 0x0101  # Alias for standard DATA tag
+    SPACE: int = 0x0102  # 1200 Hz Space tone burst (start_tick, length_ticks)
+    MARK: int = 0x0103  # 2400 Hz Mark carrier tone (start_tick, length_ticks)
+
+
+class DataSubHeader:
+    """12-byte T88 DATA block sub-header (<IIHH)."""
+
+    STRUCT_FORMAT: str = "<IIHH"
+    SIZE: int = 12
+
+    def __init__(
+        self,
+        start_tick: int = 0,
+        length_ticks: int = 0,
+        data_len: int = 0,
+        fmt_code: int = 0x01CC,
+    ):
+        self.start_tick = int(start_tick)
+        self.length_ticks = int(length_ticks)
+        self.data_len = int(data_len)
+        self.fmt_code = int(fmt_code)
+
+    def pack(self) -> bytes:
+        return struct.pack(
+            self.STRUCT_FORMAT,
+            self.start_tick,
+            self.length_ticks,
+            self.data_len,
+            self.fmt_code,
+        )
+
+    @classmethod
+    def unpack(cls, data: bytes) -> "DataSubHeader":
+        st, lt, dlen, fmt = struct.unpack(cls.STRUCT_FORMAT, data[:12])
+        return cls(st, lt, dlen, fmt)
 
 
 # ============================================================================
@@ -568,19 +625,19 @@ class T88StreamWriter:
     def write_blank(self, start_tick: int, length_tick: int):
         if length_tick > 0:
             self._write_tag(
-                0x0100, struct.pack("<II", int(start_tick), int(length_tick))
+                T88Tag.GAP, struct.pack("<II", int(start_tick), int(length_tick))
             )
 
     def write_space(self, start_tick: int, length_tick: int):
         if length_tick > 0:
             self._write_tag(
-                0x0102, struct.pack("<II", int(start_tick), int(length_tick))
+                T88Tag.SPACE, struct.pack("<II", int(start_tick), int(length_tick))
             )
 
     def write_mark(self, start_tick: int, length_tick: int):
         if length_tick > 0:
             self._write_tag(
-                0x0103, struct.pack("<II", int(start_tick), int(length_tick))
+                T88Tag.MARK, struct.pack("<II", int(start_tick), int(length_tick))
             )
 
     def write_data(self, start_tick: int, baud: int, data_bytes: bytes):
@@ -594,13 +651,13 @@ class T88StreamWriter:
         while offset < len(data_bytes):
             chunk = data_bytes[offset : offset + 32768]
             length_tick = len(chunk) * ticks_per_byte
-            hdr = struct.pack("<IIHH", int(cur_tick), int(length_tick), len(chunk), fmt)
-            self._write_tag(0x0101, hdr + chunk)
+            hdr = DataSubHeader(cur_tick, length_tick, len(chunk), fmt).pack()
+            self._write_tag(T88Tag.DATA, hdr + chunk)
             offset += len(chunk)
             cur_tick += length_tick
 
     def write_end(self):
-        self._write_tag(0x0000, b"")
+        self._write_tag(T88Tag.END, b"")
 
 
 # ============================================================================
@@ -619,6 +676,7 @@ def process_stream(
     supported_bauds: Tuple[int, ...] = (600, 1200),
     channel_mode: str = "auto",
     confidence_threshold: float = 0.75,
+    flavor: str = "reconstructed",
     quiet: bool = False,
 ):
     if not quiet:
@@ -639,7 +697,7 @@ def process_stream(
         )
         log_diag(
             f"Source: {reader.sample_rate} Hz, {reader.bits_per_sample}-bit, {chan_desc}, "
-            f"Baud: {baud_desc}, Min Confidence: {confidence_threshold * 100:.1f}%"
+            f"Baud: {baud_desc}, Flavor: {flavor.upper()}, Min Confidence: {confidence_threshold * 100:.1f}%"
         )
 
     demod = BaudAgnosticPulseRecognizer(fs)
@@ -1370,9 +1428,9 @@ def run_test_suite() -> bool:
         decoded_blocks = []
         for tag_id, payload in tags:
             if tag_id == 0x0101:
-                st, lt, blen, fmt = struct.unpack("<IIHH", payload[:12])
-                pdata = payload[12 : 12 + blen]
-                baud = 1200 if fmt == 0x01CC else 600
+                dsh = DataSubHeader.unpack(payload[:12])
+                pdata = payload[12 : 12 + dsh.data_len]
+                baud = 1200 if dsh.fmt_code == 0x01CC else 600
                 decoded_blocks.append((baud, pdata))
 
         matched = len(decoded_blocks) == len(tc["blocks"])
@@ -1492,9 +1550,9 @@ def run_test_suite() -> bool:
         out = []
         for tag_id, payload in parse_t88_stream(out_io.getvalue()):
             if tag_id == 0x0101:
-                st, lt, blen, fmt = struct.unpack("<IIHH", payload[:12])
-                baud = 1200 if fmt == 0x01CC else 600
-                out.append((baud, payload[12 : 12 + blen]))
+                dsh = DataSubHeader.unpack(payload[:12])
+                baud = 1200 if dsh.fmt_code == 0x01CC else 600
+                out.append((baud, payload[12 : 12 + dsh.data_len]))
         return out
 
     session_cases = []
@@ -1720,6 +1778,19 @@ def main():
         type=str,
         default="600,1200",
         help="Comma-separated candidate baud rates for autodetect mode (default: 600,1200)",
+    )
+    parser.add_argument(
+        "--flavor",
+        type=str,
+        default="reconstructed",
+        choices=[
+            "verbatim",
+            "reconstructed",
+            "kinematic-infilled",
+            "rom-authentic",
+            "canonical",
+        ],
+        help="Demodulation timing flavor (default: reconstructed)",
     )
     parser.add_argument(
         "--confidence",

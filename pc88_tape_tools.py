@@ -80,10 +80,162 @@ class T88Tag:
     VERSION: int = 0x0001
     GAP: int = 0x0100  # Blank / gap tag (start_tick: uint32, length_ticks: uint32)
     COMMENT: int = 0x0010
+    DATA: int = 0x0101
     DATA_300: int = 0x0101  # DATA tag with 12-byte timing/length sub-header
     DATA_1200: int = 0x0101  # DATA tag with 12-byte timing/length sub-header
     SPACE: int = 0x0102  # Space carrier tag
     MARK: int = 0x0103  # Mark carrier lead-in tag
+
+
+class DataSubHeader:
+    """12-byte T88 DATA block sub-header (<IIHH)."""
+
+    STRUCT_FORMAT: str = "<IIHH"
+    SIZE: int = 12
+
+    def __init__(
+        self,
+        start_tick: int = 0,
+        length_ticks: int = 0,
+        data_len: int = 0,
+        fmt_code: int = 0x01CC,
+    ):
+        self.start_tick = int(start_tick)
+        self.length_ticks = int(length_ticks)
+        self.data_len = int(data_len)
+        self.fmt_code = int(fmt_code)
+
+    def pack(self) -> bytes:
+        return struct.pack(
+            self.STRUCT_FORMAT,
+            self.start_tick,
+            self.length_ticks,
+            self.data_len,
+            self.fmt_code,
+        )
+
+    @classmethod
+    def unpack(cls, data: bytes) -> "DataSubHeader":
+        st, lt, dlen, fmt = struct.unpack(cls.STRUCT_FORMAT, data[:12])
+        return cls(st, lt, dlen, fmt)
+
+
+class ProtocolProfile:
+    """Encapsulates timing and structural parameters for a PC-8001/PC-8801 tape protocol."""
+
+    def __init__(
+        self,
+        name: str,
+        type_code: int,
+        lead_space_ticks: int,
+        lead_mark_ticks: int,
+        inter_mark_ticks: int = 960,
+        post_mark_ticks: int = 6240,
+        post_space_ticks: int = 12000,
+        post_gap_ticks: int = 16320,
+        default_baud: int = 1200,
+    ):
+        self.name = name
+        self.type_code = type_code
+        self.lead_space_ticks = lead_space_ticks
+        self.lead_mark_ticks = lead_mark_ticks
+        self.inter_mark_ticks = inter_mark_ticks
+        self.post_mark_ticks = post_mark_ticks
+        self.post_space_ticks = post_space_ticks
+        self.post_gap_ticks = post_gap_ticks
+        self.default_baud = default_baud
+
+
+class ProtocolRegistry:
+    """Centralized registry for PC-8001/PC-8801 tape protocol definitions and timing constants."""
+
+    BASIC = ProtocolProfile(
+        name="BASIC Program (0xD3)",
+        type_code=0xD3,
+        lead_space_ticks=12000,
+        lead_mark_ticks=2400,
+        inter_mark_ticks=960,
+        post_mark_ticks=6240,
+        post_space_ticks=12000,
+        post_gap_ticks=16320,
+        default_baud=1200,
+    )
+    MON_HEADER = ProtocolProfile(
+        name="MON Machine Language Header (0x24)",
+        type_code=0x24,
+        lead_space_ticks=4800,
+        lead_mark_ticks=12000,
+        inter_mark_ticks=960,
+        post_mark_ticks=6240,
+        post_space_ticks=12000,
+        post_gap_ticks=16320,
+        default_baud=1200,
+    )
+    MON_RECORDS = ProtocolProfile(
+        name="MON Machine Language Records (0x3A)",
+        type_code=0x3A,
+        lead_space_ticks=4800,
+        lead_mark_ticks=12000,
+        inter_mark_ticks=960,
+        post_mark_ticks=6240,
+        post_space_ticks=12000,
+        post_gap_ticks=16320,
+        default_baud=1200,
+    )
+    ASCII = ProtocolProfile(
+        name="ASCII / Sequential File (0x9C)",
+        type_code=0x9C,
+        lead_space_ticks=12000,
+        lead_mark_ticks=2400,
+        inter_mark_ticks=960,
+        post_mark_ticks=6240,
+        post_space_ticks=12000,
+        post_gap_ticks=16320,
+        default_baud=1200,
+    )
+    NONTAMA = ProtocolProfile(
+        name="NONTAMA Machine Language Loader",
+        type_code=0xFF,
+        lead_space_ticks=4800,
+        lead_mark_ticks=12000,
+        inter_mark_ticks=960,
+        post_mark_ticks=6240,
+        post_space_ticks=12000,
+        post_gap_ticks=16320,
+        default_baud=1200,
+    )
+    RAW = ProtocolProfile(
+        name="Raw Data / Unknown",
+        type_code=0x00,
+        lead_space_ticks=12000,
+        lead_mark_ticks=2400,
+        inter_mark_ticks=960,
+        post_mark_ticks=6240,
+        post_space_ticks=12000,
+        post_gap_ticks=16320,
+        default_baud=1200,
+    )
+
+    PROFILES = {
+        0xD3: BASIC,
+        0x24: MON_HEADER,
+        0x3A: MON_RECORDS,
+        0x9C: ASCII,
+        0xFF: NONTAMA,
+        0x00: RAW,
+    }
+
+    @classmethod
+    def get_profile(cls, type_code: int) -> ProtocolProfile:
+        return cls.PROFILES.get(type_code, cls.RAW)
+
+    @staticmethod
+    def get_fmt_code(baud: int) -> int:
+        return 0x01CC if baud >= 1200 else 0x00CC
+
+    @staticmethod
+    def get_ticks_per_byte(baud: int) -> int:
+        return int(round(44 * 1200 / baud)) if baud > 0 else 44
 
 
 class T88Block:
@@ -191,8 +343,8 @@ class T88File:
         for block in self.blocks:
             if block.tag == 0x0101 and block.data:
                 if len(block.data) >= 12:
-                    _, _, dlen, _ = struct.unpack("<IIHH", block.data[:12])
-                    payload_chunks.append(block.data[12 : 12 + dlen])
+                    dsh = DataSubHeader.unpack(block.data[:12])
+                    payload_chunks.append(block.data[12 : 12 + dsh.data_len])
                 else:
                     payload_chunks.append(block.data)
 
@@ -236,8 +388,8 @@ class T88File:
             comment_bytes = comment.encode("utf-8", errors="ignore")
             blocks.append(T88Block(T88Tag.COMMENT, comment_bytes))
 
-        fmt_code = 0x01CC if baud >= 1200 else 0x00CC
-        ticks_per_byte = int(round(44 * 1200 / baud)) if baud > 0 else 44
+        fmt_code = ProtocolRegistry.get_fmt_code(baud)
+        ticks_per_byte = ProtocolRegistry.get_ticks_per_byte(baud)
         current_tick = 0
 
         if not cmt_data:
@@ -251,7 +403,7 @@ class T88File:
             current_tick += 12000
             blocks.append(T88Block(T88Tag.MARK, struct.pack("<II", current_tick, 2400)))
             current_tick += 2400
-            data_header = struct.pack("<IIHH", current_tick, 0, 0, fmt_code)
+            data_header = DataSubHeader(current_tick, 0, 0, fmt_code).pack()
             blocks.append(T88Block(0x0101, data_header))
         else:
             cmt_obj = CMTFile(cmt_data)
@@ -260,13 +412,14 @@ class T88File:
                 split_items = [("part", "Raw Data / Unknown", cmt_data)]
 
             for file_idx, (name, ftype, chunk) in enumerate(split_items):
-                is_mon = (
-                    (len(chunk) > 0 and chunk[0] in (0x24, 0x3A))
-                    or ("MON" in ftype)
-                    or ("NONTAMA" in ftype)
+                type_code = (
+                    chunk[0]
+                    if (chunk and chunk[0] in ProtocolRegistry.PROFILES)
+                    else (0xFF if "NONTAMA" in ftype else 0x00)
                 )
-                space_len = 4800 if is_mon else 12000
-                mark_len = 12000 if is_mon else 2400
+                profile = ProtocolRegistry.get_profile(type_code)
+                space_len = profile.lead_space_ticks
+                mark_len = profile.lead_mark_ticks
 
                 if file_idx == 0:
                     blocks.append(
@@ -317,24 +470,27 @@ class T88File:
                     body_data = chunk[hdr_len:]
 
                     h_ticks = len(hdr_data) * ticks_per_byte
-                    h_hdr = struct.pack(
-                        "<IIHH", current_tick, h_ticks, len(hdr_data), fmt_code
-                    )
+                    h_hdr = DataSubHeader(
+                        current_tick, h_ticks, len(hdr_data), fmt_code
+                    ).pack()
                     blocks.append(T88Block(0x0101, h_hdr + hdr_data))
                     current_tick += h_ticks
 
                     blocks.append(
-                        T88Block(T88Tag.MARK, struct.pack("<II", current_tick, 960))
+                        T88Block(
+                            T88Tag.MARK,
+                            struct.pack("<II", current_tick, profile.inter_mark_ticks),
+                        )
                     )
-                    current_tick += 960
+                    current_tick += profile.inter_mark_ticks
 
                     for offset in range(0, len(body_data), chunk_size):
                         subchunk = body_data[offset : offset + chunk_size]
                         data_len = len(subchunk)
                         data_ticks = data_len * ticks_per_byte
-                        data_header = struct.pack(
-                            "<IIHH", current_tick, data_ticks, data_len, fmt_code
-                        )
+                        data_header = DataSubHeader(
+                            current_tick, data_ticks, data_len, fmt_code
+                        ).pack()
                         blocks.append(T88Block(0x0101, data_header + subchunk))
                         current_tick += data_ticks
                 else:
@@ -342,24 +498,33 @@ class T88File:
                         subchunk = chunk[offset : offset + chunk_size]
                         data_len = len(subchunk)
                         data_ticks = data_len * ticks_per_byte
-                        data_header = struct.pack(
-                            "<IIHH", current_tick, data_ticks, data_len, fmt_code
-                        )
+                        data_header = DataSubHeader(
+                            current_tick, data_ticks, data_len, fmt_code
+                        ).pack()
                         blocks.append(T88Block(0x0101, data_header + subchunk))
                         current_tick += data_ticks
 
                 blocks.append(
-                    T88Block(T88Tag.MARK, struct.pack("<II", current_tick, 6240))
+                    T88Block(
+                        T88Tag.MARK,
+                        struct.pack("<II", current_tick, profile.post_mark_ticks),
+                    )
                 )
-                current_tick += 6240
+                current_tick += profile.post_mark_ticks
                 blocks.append(
-                    T88Block(T88Tag.SPACE, struct.pack("<II", current_tick, 12000))
+                    T88Block(
+                        T88Tag.SPACE,
+                        struct.pack("<II", current_tick, profile.post_space_ticks),
+                    )
                 )
-                current_tick += 12000
+                current_tick += profile.post_space_ticks
                 blocks.append(
-                    T88Block(T88Tag.GAP, struct.pack("<II", current_tick, 16320))
+                    T88Block(
+                        T88Tag.GAP,
+                        struct.pack("<II", current_tick, profile.post_gap_ticks),
+                    )
                 )
-                current_tick += 16320
+                current_tick += profile.post_gap_ticks
 
         blocks.append(T88Block(T88Tag.END, b""))
         return cls(magic=cls.DEFAULT_MAGIC, version=0x0100, blocks=blocks)
@@ -900,8 +1065,8 @@ def split_t88_file(
                 if b.tag == 0x0101:
                     payload = b""
                     if len(b.data) >= 12:
-                        _, _, dlen, _ = struct.unpack("<IIHH", b.data[:12])
-                        payload = b.data[12 : 12 + dlen]
+                        dsh = DataSubHeader.unpack(b.data[:12])
+                        payload = b.data[12 : 12 + dsh.data_len]
                     else:
                         payload = b.data
 
@@ -1012,21 +1177,27 @@ def split_t88_file(
                                 new_blocks.append(T88Block(b.tag, b.data))
                         elif b.tag == 0x0101:
                             if len(b.data) >= 12:
-                                st, lt, dlen, res = struct.unpack("<IIHH", b.data[:12])
+                                dsh = DataSubHeader.unpack(b.data[:12])
+                                st, lt, dlen, res = (
+                                    dsh.start_tick,
+                                    dsh.length_ticks,
+                                    dsh.data_len,
+                                    dsh.fmt_code,
+                                )
                                 payload = b.data[12 : 12 + dlen]
                                 if baud is None:
                                     new_st = max(0, st - min_tick)
                                     new_lt = lt
                                 else:
                                     ticks_per_byte = (
-                                        int(round(44 * 1200 / baud)) if baud > 0 else 44
+                                        ProtocolRegistry.get_ticks_per_byte(baud)
                                     )
                                     new_lt = dlen * ticks_per_byte
                                     new_st = curr_tick
                                     curr_tick += new_lt
-                                    res = 0x01CC if baud >= 1200 else 0x00CC
+                                    res = ProtocolRegistry.get_fmt_code(baud)
                                 new_b_data = (
-                                    struct.pack("<IIHH", new_st, new_lt, dlen, res)
+                                    DataSubHeader(new_st, new_lt, dlen, res).pack()
                                     + payload
                                 )
                                 new_blocks.append(T88Block(b.tag, new_b_data))
@@ -1158,7 +1329,13 @@ def join_t88_files(
 
                     elif b.tag == 0x0101:
                         if len(b.data) >= 12:
-                            st, lt, dlen, res = struct.unpack("<IIHH", b.data[:12])
+                            dsh = DataSubHeader.unpack(b.data[:12])
+                            st, lt, dlen, res = (
+                                dsh.start_tick,
+                                dsh.length_ticks,
+                                dsh.data_len,
+                                dsh.fmt_code,
+                            )
                             payload = b.data[12 : 12 + dlen]
                             if baud is None:
                                 new_st = file_start_tick + max(0, st - min_tick)
@@ -1166,16 +1343,16 @@ def join_t88_files(
                                 file_max_end = max(file_max_end, new_st + new_lt)
                                 new_fmt = res
                             else:
-                                ticks_per_byte = (
-                                    int(round(44 * 1200 / baud)) if baud > 0 else 44
+                                ticks_per_byte = ProtocolRegistry.get_ticks_per_byte(
+                                    baud
                                 )
                                 new_lt = dlen * ticks_per_byte
                                 new_st = current_tick
                                 current_tick += new_lt
                                 file_max_end = current_tick
-                                new_fmt = 0x01CC if baud >= 1200 else 0x00CC
+                                new_fmt = ProtocolRegistry.get_fmt_code(baud)
                             new_b_data = (
-                                struct.pack("<IIHH", new_st, new_lt, dlen, new_fmt)
+                                DataSubHeader(new_st, new_lt, dlen, new_fmt).pack()
                                 + payload
                             )
                             combined_blocks.append(T88Block(b.tag, new_b_data))
@@ -1200,10 +1377,8 @@ def join_t88_files(
             current_tick += 9600
 
         effective_cmt_baud = baud if baud is not None else default_baud
-        ticks_per_byte = (
-            int(round(44 * 1200 / effective_cmt_baud)) if effective_cmt_baud > 0 else 44
-        )
-        fmt_code = 0x01CC if effective_cmt_baud >= 1200 else 0x00CC
+        ticks_per_byte = ProtocolRegistry.get_ticks_per_byte(effective_cmt_baud)
+        fmt_code = ProtocolRegistry.get_fmt_code(effective_cmt_baud)
         mark_len = 9600
         combined_blocks.append(
             T88Block(T88Tag.MARK, struct.pack("<II", current_tick, mark_len))
@@ -1211,16 +1386,16 @@ def join_t88_files(
         current_tick += mark_len
 
         if not data:
-            data_header = struct.pack("<IIHH", current_tick, 0, 0, fmt_code)
+            data_header = DataSubHeader(current_tick, 0, 0, fmt_code).pack()
             combined_blocks.append(T88Block(0x0101, data_header))
         else:
             for offset in range(0, len(data), chunk_size):
                 chunk = data[offset : offset + chunk_size]
                 data_len = len(chunk)
                 data_ticks = data_len * ticks_per_byte
-                data_header = struct.pack(
-                    "<IIHH", current_tick, data_ticks, data_len, fmt_code
-                )
+                data_header = DataSubHeader(
+                    current_tick, data_ticks, data_len, fmt_code
+                ).pack()
                 combined_blocks.append(T88Block(0x0101, data_header + chunk))
                 current_tick += data_ticks
 
@@ -1262,7 +1437,13 @@ def analyze_tape(input_path: str, verbose: bool = False) -> str:
 
         data_blocks = [b for b in t88.blocks if b.tag == 0x0101 and len(b.data) >= 12]
         if data_blocks:
-            st, lt, dlen, _ = struct.unpack("<IIHH", data_blocks[0].data[:12])
+            dsh = DataSubHeader.unpack(data_blocks[0].data[:12])
+            st, lt, dlen, _ = (
+                dsh.start_tick,
+                dsh.length_ticks,
+                dsh.data_len,
+                dsh.fmt_code,
+            )
             if dlen > 0:
                 tpb = lt / dlen
                 est_baud = int(round(44 * 1200 / tpb)) if tpb > 0 else 1200
@@ -1282,7 +1463,13 @@ def analyze_tape(input_path: str, verbose: bool = False) -> str:
             for idx, b in enumerate(t88.blocks):
                 tname = tag_names.get(b.tag, f"0x{b.tag:04X}")
                 if b.tag == 0x0101 and len(b.data) >= 12:
-                    st, lt, dlen, res = struct.unpack("<IIHH", b.data[:12])
+                    dsh = DataSubHeader.unpack(b.data[:12])
+                    st, lt, dlen, res = (
+                        dsh.start_tick,
+                        dsh.length_ticks,
+                        dsh.data_len,
+                        dsh.fmt_code,
+                    )
                     pld = b.data[12 : 12 + dlen]
                     fn, ft = CMTFile.extract_file_info(pld)
                     fn_str = f" [name='{fn}' type='{ft}']" if fn else ""
@@ -1653,7 +1840,7 @@ class TestPC88TapeTool(unittest.TestCase):
         self.basic_and_two_mon_o_tape = self.basic_file + self.mon_o_1 + self.mon_o_2
 
     def test_t88_block_pack_unpack(self) -> None:
-        header = struct.pack("<IIHH", 0, 440, 10, 0)
+        header = DataSubHeader(0, 440, 10, 0).pack()
         b_data = T88Block(T88Tag.DATA_1200, header + b"1234567890")
         p_data = b_data.pack()
         u_data = T88Block.unpack(io.BytesIO(p_data))
@@ -1690,23 +1877,23 @@ class TestPC88TapeTool(unittest.TestCase):
         data_blocks_1200 = [b for b in t88_1200.blocks if b.tag == 0x0101]
         data_blocks_300 = [b for b in t88_300.blocks if b.tag == 0x0101]
         tot_dlen_1200 = sum(
-            struct.unpack("<IIHH", b.data[:12])[2] for b in data_blocks_1200
+            DataSubHeader.unpack(b.data[:12]).data_len for b in data_blocks_1200
         )
         tot_ticks_1200 = sum(
-            struct.unpack("<IIHH", b.data[:12])[1] for b in data_blocks_1200
+            DataSubHeader.unpack(b.data[:12]).length_ticks for b in data_blocks_1200
         )
         tot_dlen_300 = sum(
-            struct.unpack("<IIHH", b.data[:12])[2] for b in data_blocks_300
+            DataSubHeader.unpack(b.data[:12]).data_len for b in data_blocks_300
         )
         tot_ticks_300 = sum(
-            struct.unpack("<IIHH", b.data[:12])[1] for b in data_blocks_300
+            DataSubHeader.unpack(b.data[:12]).length_ticks for b in data_blocks_300
         )
         self.assertEqual(tot_dlen_1200, len(self.ml_file))
         self.assertEqual(tot_dlen_300, len(self.ml_file))
         self.assertEqual(tot_ticks_1200, len(self.ml_file) * 44)
         self.assertEqual(tot_ticks_300, len(self.ml_file) * 176)
-        fmt_1200 = struct.unpack("<IIHH", data_blocks_1200[0].data[:12])[3]
-        fmt_300 = struct.unpack("<IIHH", data_blocks_300[0].data[:12])[3]
+        fmt_1200 = DataSubHeader.unpack(data_blocks_1200[0].data[:12]).fmt_code
+        fmt_300 = DataSubHeader.unpack(data_blocks_300[0].data[:12]).fmt_code
         self.assertEqual(fmt_1200, 0x01CC)
         self.assertEqual(fmt_300, 0x00CC)
 
@@ -1818,8 +2005,8 @@ class TestPC88TapeTool(unittest.TestCase):
         self.assertEqual(unpacked.extract_cmt_payload(), large_data)
 
     def test_split_t88_with_carrier_blocks(self) -> None:
-        h1 = struct.pack("<IIHH", 0, 440, len(self.ml_file), 0)
-        h2 = struct.pack("<IIHH", 10000, 440, len(self.basic_file), 0)
+        h1 = DataSubHeader(0, 440, len(self.ml_file), 0).pack()
+        h2 = DataSubHeader(10000, 440, len(self.basic_file), 0).pack()
         blocks = [
             T88Block(T88Tag.DATA_1200, h1 + self.ml_file),
             T88Block(T88Tag.MARK, struct.pack("<II", 9600, 4800)),
@@ -1837,10 +2024,10 @@ class TestPC88TapeTool(unittest.TestCase):
     def test_t88_to_t88_split_and_join_preserves_timing_and_carrier_blocks(
         self,
     ) -> None:
-        h1 = struct.pack("<IIHH", 9600, len(self.ml_file) * 44, len(self.ml_file), 0)
-        h2 = struct.pack(
-            "<IIHH", 25000, len(self.basic_file) * 176, len(self.basic_file), 0
-        )
+        h1 = DataSubHeader(9600, len(self.ml_file) * 44, len(self.ml_file), 0).pack()
+        h2 = DataSubHeader(
+            25000, len(self.basic_file) * 176, len(self.basic_file), 0
+        ).pack()
         blocks = [
             T88Block(T88Tag.VERSION, struct.pack("<H", 0x0100)),
             T88Block(T88Tag.MARK, struct.pack("<II", 0, 9600)),
@@ -1873,10 +2060,10 @@ class TestPC88TapeTool(unittest.TestCase):
 
             dblock1 = [b for b in t88_part1.blocks if b.tag == 0x0101][0]
             dblock2 = [b for b in t88_part2.blocks if b.tag == 0x0101][0]
-            _, ticks1, dlen1, _ = struct.unpack("<IIHH", dblock1.data[:12])
-            _, ticks2, dlen2, _ = struct.unpack("<IIHH", dblock2.data[:12])
-            self.assertEqual(ticks1, dlen1 * 44)
-            self.assertEqual(ticks2, dlen2 * 176)
+            dsh1 = DataSubHeader.unpack(dblock1.data[:12])
+            dsh2 = DataSubHeader.unpack(dblock2.data[:12])
+            self.assertEqual(dsh1.length_ticks, dsh1.data_len * 44)
+            self.assertEqual(dsh2.length_ticks, dsh2.data_len * 176)
 
             res_join = join_t88_files(
                 [split_info[0][3], split_info[1][3]], rejoined_out, baud=None
@@ -1907,7 +2094,9 @@ class TestPC88TapeTool(unittest.TestCase):
 
             data_blocks = [b for b in joined_t88.blocks if b.tag == 0x0101]
             self.assertEqual(len(data_blocks), 3)
-            tot_dlen = sum(struct.unpack("<IIHH", b.data[:12])[2] for b in data_blocks)
+            tot_dlen = sum(
+                DataSubHeader.unpack(b.data[:12]).data_len for b in data_blocks
+            )
             self.assertEqual(tot_dlen, len(self.basic_file) + len(self.ml_file))
 
     def test_t88_to_t88_split_and_join_with_baud_override(self) -> None:
@@ -1925,8 +2114,8 @@ class TestPC88TapeTool(unittest.TestCase):
                 with open(out_path, "rb") as f:
                     part = T88File.unpack(io.BytesIO(f.read()))
                 dblock = [b for b in part.blocks if b.tag == 0x0101][0]
-                _, ticks, dlen, _ = struct.unpack("<IIHH", dblock.data[:12])
-                self.assertEqual(ticks, dlen * 176)
+                dsh = DataSubHeader.unpack(dblock.data[:12])
+                self.assertEqual(dsh.length_ticks, dsh.data_len * 176)
 
             split_files = [item[3] for item in split_info]
             res_join = join_t88_files(split_files, rejoined_out, baud=1200)
@@ -1934,8 +2123,8 @@ class TestPC88TapeTool(unittest.TestCase):
                 rejoined = T88File.unpack(io.BytesIO(f.read()))
 
             for b in [b for b in rejoined.blocks if b.tag == 0x0101]:
-                _, ticks, dlen, _ = struct.unpack("<IIHH", b.data[:12])
-                self.assertEqual(ticks, dlen * 44)
+                dsh = DataSubHeader.unpack(b.data[:12])
+                self.assertEqual(dsh.length_ticks, dsh.data_len * 44)
 
     def test_diagnostic_analyze_mode_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1971,14 +2160,12 @@ class TestPC88TapeTool(unittest.TestCase):
         self.assertEqual(len(mark_blocks_1200), 3)
         self.assertEqual(len(space_blocks_1200), 2)
         self.assertEqual(len(gap_blocks_1200), 3)
-        _, _, dlen_hdr, fmt_hdr = struct.unpack("<IIHH", data_blocks_1200[0].data[:12])
-        _, _, dlen_body, fmt_body = struct.unpack(
-            "<IIHH", data_blocks_1200[1].data[:12]
-        )
-        self.assertEqual(dlen_hdr, 16)
-        self.assertEqual(fmt_hdr, 0x01CC)
-        self.assertEqual(dlen_hdr + dlen_body, len(self.basic_file))
-        self.assertEqual(fmt_body, 0x01CC)
+        dsh_hdr = DataSubHeader.unpack(data_blocks_1200[0].data[:12])
+        dsh_body = DataSubHeader.unpack(data_blocks_1200[1].data[:12])
+        self.assertEqual(dsh_hdr.data_len, 16)
+        self.assertEqual(dsh_hdr.fmt_code, 0x01CC)
+        self.assertEqual(dsh_hdr.data_len + dsh_body.data_len, len(self.basic_file))
+        self.assertEqual(dsh_body.fmt_code, 0x01CC)
         _, mark_burst_len_lead = struct.unpack("<II", mark_blocks_1200[0].data[:8])
         self.assertEqual(mark_burst_len_lead, 2400)
         _, mark_burst_len_inter = struct.unpack("<II", mark_blocks_1200[1].data[:8])
@@ -1988,15 +2175,11 @@ class TestPC88TapeTool(unittest.TestCase):
         t88_600 = T88File.from_cmt_data(self.ml_file, baud=600)
         data_blocks_600 = [b for b in t88_600.blocks if b.tag == 0x0101]
         self.assertEqual(len(data_blocks_600), 2)
-        _, _, dlen_600_hdr, fmt_600_hdr = struct.unpack(
-            "<IIHH", data_blocks_600[0].data[:12]
-        )
-        _, _, dlen_600_body, fmt_600_body = struct.unpack(
-            "<IIHH", data_blocks_600[1].data[:12]
-        )
-        self.assertEqual(dlen_600_hdr, 16)
-        self.assertEqual(fmt_600_hdr, 0x00CC)
-        self.assertEqual(fmt_600_body, 0x00CC)
+        dsh_600_hdr = DataSubHeader.unpack(data_blocks_600[0].data[:12])
+        dsh_600_body = DataSubHeader.unpack(data_blocks_600[1].data[:12])
+        self.assertEqual(dsh_600_hdr.data_len, 16)
+        self.assertEqual(dsh_600_hdr.fmt_code, 0x00CC)
+        self.assertEqual(dsh_600_body.fmt_code, 0x00CC)
 
     def test_join_t88_gap_intervals(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir_inner:
